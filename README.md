@@ -1,20 +1,33 @@
-# RBK Vendedor IA — Gateway de Voz v0.2.0
+# RBK Vendedor IA — Gateway de Voz v0.3.0
 
-Esta versão mantém o eco do ramal `602` e adiciona transcrição real pela Groq
-no ramal `603`.
+Primeiro ciclo completo de voz:
 
-## Modos por UUID
+```text
+fala do cliente
+→ Whisper Groq
+→ Llama 3.1 8B Groq
+→ Piper TTS local
+→ resposta na ligação
+```
 
-- `11111111-1111-4111-8111-111111111111`: eco AudioSocket.
-- `22222222-2222-4222-8222-222222222222`: captura de fala e STT Groq.
+## Ramais
 
-## Funcionamento do ramal 603
+- `602`: eco pelo gateway.
+- `603`: transcrição Groq.
+- `604`: uma interação completa com STT, LLM e TTS.
 
-1. O Asterisk reproduz um bip.
-2. O usuário fala uma frase curta.
-3. O gateway detecta silêncio.
-4. O áudio PCM é convertido para WAV.
-5. O WAV é enviado ao modelo `whisper-large-v3-turbo`.
-6. A transcrição aparece no log como `TRANSCRICAO GROQ`.
+## Voz local
 
-Nesta etapa ainda não há resposta falada da IA.
+O Dockerfile instala `piper-tts==1.4.2` e baixa a voz
+`pt_BR-faber-medium`.
+
+O modelo Faber é pt-BR, qualidade medium, 22.050 Hz e tem dataset CC0.
+O Piper é distribuído sob GPL-3.0.
+
+## Limites desta versão
+
+- Um único turno de conversa.
+- Uma chamada simultânea.
+- Sem interrupção da fala da IA.
+- Sem consulta ao ERP.
+- A IA não pode informar preço, estoque ou compatibilidade.

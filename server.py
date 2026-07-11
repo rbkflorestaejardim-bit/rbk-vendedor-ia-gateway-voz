@@ -1,17 +1,23 @@
 import asyncio
+import audioop
 import io
 import json
 import logging
 import math
 import os
+import re
 import signal
 import struct
+import time
 import urllib.error
 import urllib.request
 import uuid
 import wave
 from collections import deque
 from dataclasses import dataclass
+from pathlib import Path
+
+from piper import PiperVoice
 
 
 HOST = os.getenv("HOST", "0.0.0.0")
@@ -24,6 +30,15 @@ GROQ_STT_MODEL = os.getenv(
     "whisper-large-v3-turbo",
 ).strip()
 GROQ_STT_LANGUAGE = os.getenv("GROQ_STT_LANGUAGE", "pt").strip()
+GROQ_LLM_MODEL = os.getenv(
+    "GROQ_LLM_MODEL",
+    "llama-3.1-8b-instant",
+).strip()
+
+PIPER_VOICE_MODEL = os.getenv(
+    "PIPER_VOICE_MODEL",
+    "/app/voices/pt_BR-faber-medium.onnx",
+).strip()
 
 ECHO_UUID = os.getenv(
     "ECHO_UUID",
@@ -32,6 +47,10 @@ ECHO_UUID = os.getenv(
 STT_UUID = os.getenv(
     "STT_UUID",
     "22222222-2222-4222-8222-222222222222",
+).strip()
+CONVERSATION_UUID = os.getenv(
+    "CONVERSATION_UUID",
+    "33333333-3333-4333-8333-333333333333",
 ).strip()
 
 VAD_RMS_THRESHOLD = int(os.getenv("VAD_RMS_THRESHOLD", "350"))
@@ -56,12 +75,39 @@ TYPE_ERROR = 0xFF
 HEADER_SIZE = 3
 MAX_PAYLOAD = 65535
 
+GREETING_TEXT = (
+    "Olá. Aqui é o Carlos da RBK Distribuidora. "
+    "Este é um teste do vendedor virtual. "
+    "Depois do sinal, diga seu nome e o produto que deseja consultar."
+)
+
+SYSTEM_PROMPT = """
+Você é Carlos, vendedor técnico da RBK Distribuidora Floresta e Jardim.
+Atende clientes sobre peças e acessórios para roçadeiras, motosserras,
+sopradores, cortadores de grama e equipamentos similares.
+
+Regras obrigatórias:
+- Responda em português do Brasil.
+- Use no máximo duas frases curtas e 240 caracteres.
+- Não use markdown, listas ou emojis.
+- Não invente preço, estoque, prazo, código, aplicação ou compatibilidade.
+- Neste piloto você ainda não consulta o ERP.
+- Faça apenas uma pergunta técnica por resposta.
+- Se o produto for genérico, pergunte marca e modelo da máquina.
+- Para corrente de motosserra, pergunte marca/modelo ou passo, calibre e
+  quantidade de elos.
+- Seja profissional, direto e cordial.
+- Não diga que é humano.
+""".strip()
+
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
 logger = logging.getLogger("gateway-voz")
+
+PIPER_VOICE: PiperVoice | None = None
 
 
 @dataclass
@@ -73,7 +119,6 @@ class SessionStats:
 
 
 def pcm_rms(payload: bytes) -> int:
-    """Calcula RMS de PCM signed linear 16-bit little-endian."""
     if len(payload) < 2:
         return 0
 
@@ -133,7 +178,7 @@ def encode_multipart(
     return bytes(body), boundary
 
 
-def transcribe_with_groq(pcm_audio: bytes) -> dict:
+def transcribe_with_groq(pcm_audio: bytes) -> str:
     if not GROQ_API_KEY:
         raise RuntimeError("GROQ_API_KEY não configurada.")
 
@@ -160,7 +205,7 @@ def transcribe_with_groq(pcm_audio: bytes) -> dict:
             "Authorization": f"Bearer {GROQ_API_KEY}",
             "Accept": "application/json",
             "Content-Type": f"multipart/form-data; boundary={boundary}",
-            "User-Agent": "RBK-Vendedor-IA-Gateway/0.2.1",
+            "User-Agent": "RBK-Vendedor-IA-Gateway/0.3.0",
         },
     )
 
@@ -170,12 +215,125 @@ def transcribe_with_groq(pcm_audio: bytes) -> dict:
                 "utf-8",
                 errors="replace",
             )
-            return json.loads(response_data)
+            payload = json.loads(response_data)
+            return (payload.get("text") or "").strip()
     except urllib.error.HTTPError as error:
         body_error = error.read().decode("utf-8", errors="replace")
         raise RuntimeError(
             f"Groq STT retornou HTTP {error.code}: {body_error}"
         ) from error
+
+
+def sanitize_llm_text(text: str) -> str:
+    text = re.sub(r"[*_`#>\[\]{}]", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > 300:
+        text = text[:297].rstrip() + "..."
+    return text
+
+
+def generate_sales_reply(transcript: str) -> str:
+    if not GROQ_API_KEY:
+        raise RuntimeError("GROQ_API_KEY não configurada.")
+
+    body = json.dumps(
+        {
+            "model": GROQ_LLM_MODEL,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": SYSTEM_PROMPT,
+                },
+                {
+                    "role": "user",
+                    "content": transcript,
+                },
+            ],
+            "temperature": 0.2,
+            "max_completion_tokens": 90,
+        }
+    ).encode("utf-8")
+
+    request = urllib.request.Request(
+        "https://api.groq.com/openai/v1/chat/completions",
+        data=body,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": "RBK-Vendedor-IA-Gateway/0.3.0",
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            payload = json.loads(
+                response.read().decode("utf-8", errors="replace")
+            )
+            content = payload["choices"][0]["message"]["content"]
+            clean_content = sanitize_llm_text(content)
+            if not clean_content:
+                raise RuntimeError("A Groq retornou uma resposta vazia.")
+            return clean_content
+    except urllib.error.HTTPError as error:
+        body_error = error.read().decode("utf-8", errors="replace")
+        raise RuntimeError(
+            f"Groq LLM retornou HTTP {error.code}: {body_error}"
+        ) from error
+
+
+def synthesize_piper_pcm8k(text: str) -> bytes:
+    if PIPER_VOICE is None:
+        raise RuntimeError("Voz Piper não carregada.")
+
+    wav_buffer = io.BytesIO()
+    with wave.open(wav_buffer, "wb") as wav_file:
+        PIPER_VOICE.synthesize_wav(text, wav_file)
+
+    wav_buffer.seek(0)
+    with wave.open(wav_buffer, "rb") as wav_file:
+        source_channels = wav_file.getnchannels()
+        source_width = wav_file.getsampwidth()
+        source_rate = wav_file.getframerate()
+        audio_data = wav_file.readframes(wav_file.getnframes())
+
+    if source_channels == 2:
+        audio_data = audioop.tomono(
+            audio_data,
+            source_width,
+            0.5,
+            0.5,
+        )
+        source_channels = 1
+
+    if source_channels != 1:
+        raise RuntimeError(
+            f"Piper gerou {source_channels} canais; esperado: 1."
+        )
+
+    if source_width != SAMPLE_WIDTH:
+        audio_data = audioop.lin2lin(
+            audio_data,
+            source_width,
+            SAMPLE_WIDTH,
+        )
+        source_width = SAMPLE_WIDTH
+
+    if source_rate != SAMPLE_RATE:
+        audio_data, _ = audioop.ratecv(
+            audio_data,
+            SAMPLE_WIDTH,
+            CHANNELS,
+            source_rate,
+            SAMPLE_RATE,
+            None,
+        )
+
+    if len(audio_data) % SAMPLE_WIDTH:
+        audio_data = audio_data[:-1]
+
+    return audio_data
 
 
 def generate_tone_frame(
@@ -190,44 +348,6 @@ def generate_tone_frame(
         angle = 2.0 * math.pi * frequency_hz * absolute_sample / SAMPLE_RATE
         samples.append(int(amplitude * math.sin(angle)))
     return struct.pack(f"<{sample_count}h", *samples)
-
-
-async def send_tone(
-    writer: asyncio.StreamWriter,
-    frequency_hz: float = 1000.0,
-    duration_seconds: float = 0.18,
-    gap_after_seconds: float = 0.12,
-) -> None:
-    total_samples = max(1, int(SAMPLE_RATE * duration_seconds))
-    sent_samples = 0
-
-    while sent_samples < total_samples:
-        frame_samples = min(
-            AUDIO_SAMPLES_PER_FRAME,
-            total_samples - sent_samples,
-        )
-        payload = generate_tone_frame(
-            frequency_hz=frequency_hz,
-            start_sample=sent_samples,
-            sample_count=frame_samples,
-        )
-        await send_frame(writer, TYPE_AUDIO_8KHZ, payload)
-        sent_samples += frame_samples
-        await asyncio.sleep(AUDIO_FRAME_MS / 1000)
-
-    if gap_after_seconds > 0:
-        silence_frames = max(
-            1,
-            int(gap_after_seconds * 1000 / AUDIO_FRAME_MS),
-        )
-        silence_payload = b"\x00" * AUDIO_BYTES_PER_FRAME
-        for _ in range(silence_frames):
-            await send_frame(
-                writer,
-                TYPE_AUDIO_8KHZ,
-                silence_payload,
-            )
-            await asyncio.sleep(AUDIO_FRAME_MS / 1000)
 
 
 async def read_exactly_or_none(
@@ -262,6 +382,92 @@ async def send_frame(
     await writer.drain()
 
 
+async def send_pcm_realtime(
+    writer: asyncio.StreamWriter,
+    pcm_audio: bytes,
+) -> float:
+    total_bytes = len(pcm_audio)
+    offset = 0
+
+    while offset < total_bytes:
+        payload = pcm_audio[offset:offset + AUDIO_BYTES_PER_FRAME]
+        if len(payload) < AUDIO_BYTES_PER_FRAME:
+            payload += b"\x00" * (
+                AUDIO_BYTES_PER_FRAME - len(payload)
+            )
+
+        await send_frame(writer, TYPE_AUDIO_8KHZ, payload)
+        offset += AUDIO_BYTES_PER_FRAME
+        await asyncio.sleep(AUDIO_FRAME_MS / 1000)
+
+    return total_bytes / (SAMPLE_RATE * SAMPLE_WIDTH)
+
+
+async def speak_text(
+    writer: asyncio.StreamWriter,
+    text: str,
+    session_uuid: str | None,
+) -> float:
+    start = time.perf_counter()
+    pcm_audio = await asyncio.to_thread(synthesize_piper_pcm8k, text)
+    synthesis_seconds = time.perf_counter() - start
+    audio_seconds = len(pcm_audio) / (SAMPLE_RATE * SAMPLE_WIDTH)
+
+    logger.info(
+        "TTS PIPER: uuid=%s sintese=%.2fs audio=%.2fs texto=%r",
+        session_uuid,
+        synthesis_seconds,
+        audio_seconds,
+        text,
+    )
+
+    await send_pcm_realtime(writer, pcm_audio)
+    return audio_seconds
+
+
+async def send_tone(
+    writer: asyncio.StreamWriter,
+    frequency_hz: float = 1000.0,
+    duration_seconds: float = 0.18,
+    gap_after_seconds: float = 0.12,
+) -> None:
+    total_samples = max(1, int(SAMPLE_RATE * duration_seconds))
+    sent_samples = 0
+
+    while sent_samples < total_samples:
+        frame_samples = min(
+            AUDIO_SAMPLES_PER_FRAME,
+            total_samples - sent_samples,
+        )
+        payload = generate_tone_frame(
+            frequency_hz=frequency_hz,
+            start_sample=sent_samples,
+            sample_count=frame_samples,
+        )
+        if len(payload) < AUDIO_BYTES_PER_FRAME:
+            payload += b"\x00" * (
+                AUDIO_BYTES_PER_FRAME - len(payload)
+            )
+
+        await send_frame(writer, TYPE_AUDIO_8KHZ, payload)
+        sent_samples += frame_samples
+        await asyncio.sleep(AUDIO_FRAME_MS / 1000)
+
+    if gap_after_seconds > 0:
+        silence_frames = max(
+            1,
+            int(gap_after_seconds * 1000 / AUDIO_FRAME_MS),
+        )
+        silence_payload = b"\x00" * AUDIO_BYTES_PER_FRAME
+        for _ in range(silence_frames):
+            await send_frame(
+                writer,
+                TYPE_AUDIO_8KHZ,
+                silence_payload,
+            )
+            await asyncio.sleep(AUDIO_FRAME_MS / 1000)
+
+
 async def handle_client(
     reader: asyncio.StreamReader,
     writer: asyncio.StreamWriter,
@@ -271,7 +477,7 @@ async def handle_client(
     mode = "unknown"
     stats = SessionStats()
 
-    stt_audio = bytearray()
+    captured_audio = bytearray()
     pre_roll: deque[bytes] = deque()
     pre_roll_duration = 0.0
     speech_started = False
@@ -315,10 +521,13 @@ async def handle_client(
                     break
 
                 session_uuid = str(uuid.UUID(bytes=payload))
+
                 if session_uuid == ECHO_UUID:
                     mode = "echo"
                 elif session_uuid == STT_UUID:
                     mode = "stt"
+                elif session_uuid == CONVERSATION_UUID:
+                    mode = "conversation"
                 else:
                     mode = "unknown"
 
@@ -336,6 +545,15 @@ async def handle_client(
                     )
                     await send_tone(writer)
                     ignore_audio_seconds = 0.25
+
+                elif mode == "conversation":
+                    greeting_duration = await speak_text(
+                        writer,
+                        GREETING_TEXT,
+                        session_uuid,
+                    )
+                    await send_tone(writer)
+                    ignore_audio_seconds = greeting_duration + 0.45
 
                 continue
 
@@ -364,7 +582,7 @@ async def handle_client(
                     )
                     continue
 
-                if mode != "stt":
+                if mode not in {"stt", "conversation"}:
                     continue
 
                 if ignore_audio_seconds > 0:
@@ -395,7 +613,7 @@ async def handle_client(
                     if is_speech:
                         speech_started = True
                         for frame in pre_roll:
-                            stt_audio.extend(frame)
+                            captured_audio.extend(frame)
                         pre_roll.clear()
                         pre_roll_duration = 0.0
                         speech_duration += frame_duration
@@ -406,7 +624,7 @@ async def handle_client(
                             rms,
                         )
                 else:
-                    stt_audio.extend(payload)
+                    captured_audio.extend(payload)
 
                     if is_speech:
                         speech_duration += frame_duration
@@ -440,22 +658,23 @@ async def handle_client(
                     payload_length,
                 )
 
-        if mode == "stt":
-            if speech_started and stt_audio:
+        if mode in {"stt", "conversation"}:
+            transcript = ""
+
+            if speech_started and captured_audio:
                 logger.info(
                     "Enviando áudio para Groq: uuid=%s motivo=%s "
                     "segundos=%.2f bytes=%s max_rms=%s",
                     session_uuid,
                     finish_reason or "conexao_encerrada",
-                    len(stt_audio) / (SAMPLE_RATE * SAMPLE_WIDTH),
-                    len(stt_audio),
+                    len(captured_audio) / (SAMPLE_RATE * SAMPLE_WIDTH),
+                    len(captured_audio),
                     stats.max_rms,
                 )
-                result = await asyncio.to_thread(
+                transcript = await asyncio.to_thread(
                     transcribe_with_groq,
-                    bytes(stt_audio),
+                    bytes(captured_audio),
                 )
-                transcript = (result.get("text") or "").strip()
                 logger.info(
                     "TRANSCRICAO GROQ: uuid=%s texto=%r",
                     session_uuid,
@@ -471,16 +690,50 @@ async def handle_client(
                     VAD_RMS_THRESHOLD,
                 )
 
-            logger.info(
-                "Enviando bip final pelo AudioSocket: uuid=%s",
-                session_uuid,
-            )
-            await send_tone(
-                writer,
-                frequency_hz=1200.0,
-                duration_seconds=0.16,
-                gap_after_seconds=0.08,
-            )
+            if mode == "stt":
+                await send_tone(
+                    writer,
+                    frequency_hz=1200.0,
+                    duration_seconds=0.16,
+                    gap_after_seconds=0.08,
+                )
+
+            elif mode == "conversation":
+                if transcript:
+                    try:
+                        reply = await asyncio.to_thread(
+                            generate_sales_reply,
+                            transcript,
+                        )
+                        logger.info(
+                            "RESPOSTA LLM: uuid=%s texto=%r",
+                            session_uuid,
+                            reply,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Falha ao gerar resposta comercial: uuid=%s",
+                            session_uuid,
+                        )
+                        reply = (
+                            "Tive uma falha ao processar sua solicitação. "
+                            "Este teste será encerrado agora."
+                        )
+                else:
+                    reply = (
+                        "Não consegui entender sua resposta. "
+                        "Este teste será encerrado agora."
+                    )
+
+                final_text = (
+                    f"{reply} Obrigado. Este teste será encerrado agora."
+                )
+                await speak_text(
+                    writer,
+                    final_text,
+                    session_uuid,
+                )
+
             await send_frame(writer, TYPE_HANGUP)
 
     except asyncio.CancelledError:
@@ -519,11 +772,27 @@ async def handle_client(
 
 
 async def main() -> None:
+    global PIPER_VOICE
+
     if not GROQ_API_KEY:
-        logger.warning(
-            "GROQ_API_KEY não configurada. O modo echo funcionará, "
-            "mas o teste STT falhará."
+        raise RuntimeError("GROQ_API_KEY não configurada.")
+
+    model_path = Path(PIPER_VOICE_MODEL)
+    if not model_path.is_file():
+        raise RuntimeError(
+            f"Modelo Piper não encontrado: {PIPER_VOICE_MODEL}"
         )
+
+    load_start = time.perf_counter()
+    PIPER_VOICE = await asyncio.to_thread(
+        PiperVoice.load,
+        str(model_path),
+    )
+    logger.info(
+        "Voz Piper carregada: modelo=%s tempo=%.2fs",
+        PIPER_VOICE_MODEL,
+        time.perf_counter() - load_start,
+    )
 
     server = await asyncio.start_server(
         handle_client,
@@ -537,12 +806,15 @@ async def main() -> None:
         for sock in server.sockets or []
     )
     logger.info(
-        "Gateway de voz RBK v0.2.1 iniciado: endereços=%s "
-        "echo_uuid=%s stt_uuid=%s modelo_stt=%s",
+        "Gateway de voz RBK v0.3.0 iniciado: endereços=%s "
+        "echo_uuid=%s stt_uuid=%s conversation_uuid=%s "
+        "modelo_stt=%s modelo_llm=%s",
         addresses,
         ECHO_UUID,
         STT_UUID,
+        CONVERSATION_UUID,
         GROQ_STT_MODEL,
+        GROQ_LLM_MODEL,
     )
 
     stop_event = asyncio.Event()
