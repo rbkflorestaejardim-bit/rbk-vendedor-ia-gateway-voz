@@ -1,48 +1,20 @@
-# RBK Vendedor IA — Gateway de Voz
+# RBK Vendedor IA — Gateway de Voz v0.2.0
 
-Gateway TCP mínimo para validar o protocolo AudioSocket do Asterisk.
+Esta versão mantém o eco do ramal `602` e adiciona transcrição real pela Groq
+no ramal `603`.
 
-## Objetivo desta versão
+## Modos por UUID
 
-Receber o áudio PCM enviado pelo Asterisk e devolvê-lo imediatamente para a
-chamada. É um teste de eco feito através de um serviço separado, preparando a
-arquitetura para STT, LLM e TTS.
+- `11111111-1111-4111-8111-111111111111`: eco AudioSocket.
+- `22222222-2222-4222-8222-222222222222`: captura de fala e STT Groq.
 
-## Porta interna
+## Funcionamento do ramal 603
 
-```text
-9019/TCP
-```
+1. O Asterisk reproduz um bip.
+2. O usuário fala uma frase curta.
+3. O gateway detecta silêncio.
+4. O áudio PCM é convertido para WAV.
+5. O WAV é enviado ao modelo `whisper-large-v3-turbo`.
+6. A transcrição aparece no log como `TRANSCRICAO GROQ`.
 
-Não publique essa porta na internet. O Asterisk acessará o serviço pela rede
-interna do projeto Easypanel.
-
-## Variáveis
-
-```env
-HOST=0.0.0.0
-PORT=9019
-LOG_LEVEL=INFO
-ECHO_AUDIO=true
-```
-
-## Protocolo tratado
-
-- `0x00`: encerramento
-- `0x01`: UUID da chamada
-- `0x03`: DTMF
-- `0x10`: PCM linear assinado, 16-bit, 8 kHz, mono
-- `0xFF`: erro
-
-## Próxima integração
-
-Depois do eco validado, o processamento será substituído por:
-
-```text
-Asterisk
-→ Gateway de Voz
-→ reconhecimento de fala
-→ agente comercial
-→ síntese de voz
-→ Asterisk
-```
+Nesta etapa ainda não há resposta falada da IA.
