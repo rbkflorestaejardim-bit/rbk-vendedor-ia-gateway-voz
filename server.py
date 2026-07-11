@@ -2,6 +2,7 @@ import asyncio
 import io
 import json
 import logging
+import math
 import os
 import signal
 import struct
@@ -42,6 +43,9 @@ PRE_ROLL_SECONDS = float(os.getenv("PRE_ROLL_SECONDS", "0.3"))
 SAMPLE_RATE = 8000
 SAMPLE_WIDTH = 2
 CHANNELS = 1
+AUDIO_FRAME_MS = 20
+AUDIO_SAMPLES_PER_FRAME = SAMPLE_RATE * AUDIO_FRAME_MS // 1000
+AUDIO_BYTES_PER_FRAME = AUDIO_SAMPLES_PER_FRAME * SAMPLE_WIDTH
 
 TYPE_HANGUP = 0x00
 TYPE_UUID = 0x01
@@ -156,7 +160,7 @@ def transcribe_with_groq(pcm_audio: bytes) -> dict:
             "Authorization": f"Bearer {GROQ_API_KEY}",
             "Accept": "application/json",
             "Content-Type": f"multipart/form-data; boundary={boundary}",
-            "User-Agent": "RBK-Vendedor-IA-Gateway/0.2.0",
+            "User-Agent": "RBK-Vendedor-IA-Gateway/0.2.1",
         },
     )
 
@@ -172,6 +176,58 @@ def transcribe_with_groq(pcm_audio: bytes) -> dict:
         raise RuntimeError(
             f"Groq STT retornou HTTP {error.code}: {body_error}"
         ) from error
+
+
+def generate_tone_frame(
+    frequency_hz: float,
+    start_sample: int,
+    sample_count: int,
+    amplitude: int = 6500,
+) -> bytes:
+    samples = []
+    for index in range(sample_count):
+        absolute_sample = start_sample + index
+        angle = 2.0 * math.pi * frequency_hz * absolute_sample / SAMPLE_RATE
+        samples.append(int(amplitude * math.sin(angle)))
+    return struct.pack(f"<{sample_count}h", *samples)
+
+
+async def send_tone(
+    writer: asyncio.StreamWriter,
+    frequency_hz: float = 1000.0,
+    duration_seconds: float = 0.18,
+    gap_after_seconds: float = 0.12,
+) -> None:
+    total_samples = max(1, int(SAMPLE_RATE * duration_seconds))
+    sent_samples = 0
+
+    while sent_samples < total_samples:
+        frame_samples = min(
+            AUDIO_SAMPLES_PER_FRAME,
+            total_samples - sent_samples,
+        )
+        payload = generate_tone_frame(
+            frequency_hz=frequency_hz,
+            start_sample=sent_samples,
+            sample_count=frame_samples,
+        )
+        await send_frame(writer, TYPE_AUDIO_8KHZ, payload)
+        sent_samples += frame_samples
+        await asyncio.sleep(AUDIO_FRAME_MS / 1000)
+
+    if gap_after_seconds > 0:
+        silence_frames = max(
+            1,
+            int(gap_after_seconds * 1000 / AUDIO_FRAME_MS),
+        )
+        silence_payload = b"\x00" * AUDIO_BYTES_PER_FRAME
+        for _ in range(silence_frames):
+            await send_frame(
+                writer,
+                TYPE_AUDIO_8KHZ,
+                silence_payload,
+            )
+            await asyncio.sleep(AUDIO_FRAME_MS / 1000)
 
 
 async def read_exactly_or_none(
@@ -223,6 +279,7 @@ async def handle_client(
     silence_duration = 0.0
     total_capture_duration = 0.0
     finish_reason: str | None = None
+    ignore_audio_seconds = 0.0
 
     logger.info("Nova conexão AudioSocket: peer=%s", peer)
 
@@ -271,6 +328,15 @@ async def handle_client(
                     mode,
                     peer,
                 )
+
+                if mode == "stt":
+                    logger.info(
+                        "Enviando bip inicial pelo AudioSocket: uuid=%s",
+                        session_uuid,
+                    )
+                    await send_tone(writer)
+                    ignore_audio_seconds = 0.25
+
                 continue
 
             if frame_type == TYPE_DTMF:
@@ -299,6 +365,13 @@ async def handle_client(
                     continue
 
                 if mode != "stt":
+                    continue
+
+                if ignore_audio_seconds > 0:
+                    ignore_audio_seconds = max(
+                        0.0,
+                        ignore_audio_seconds - frame_duration,
+                    )
                     continue
 
                 total_capture_duration += frame_duration
@@ -398,6 +471,18 @@ async def handle_client(
                     VAD_RMS_THRESHOLD,
                 )
 
+            logger.info(
+                "Enviando bip final pelo AudioSocket: uuid=%s",
+                session_uuid,
+            )
+            await send_tone(
+                writer,
+                frequency_hz=1200.0,
+                duration_seconds=0.16,
+                gap_after_seconds=0.08,
+            )
+            await send_frame(writer, TYPE_HANGUP)
+
     except asyncio.CancelledError:
         raise
     except (ConnectionError, BrokenPipeError) as exc:
@@ -452,7 +537,7 @@ async def main() -> None:
         for sock in server.sockets or []
     )
     logger.info(
-        "Gateway de voz RBK v0.2.0 iniciado: endereços=%s "
+        "Gateway de voz RBK v0.2.1 iniciado: endereços=%s "
         "echo_uuid=%s stt_uuid=%s modelo_stt=%s",
         addresses,
         ECHO_UUID,
