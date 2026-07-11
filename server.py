@@ -52,6 +52,14 @@ CONVERSATION_UUID = os.getenv(
     "CONVERSATION_UUID",
     "33333333-3333-4333-8333-333333333333",
 ).strip()
+MULTITURN_UUID = os.getenv(
+    "MULTITURN_UUID",
+    "44444444-4444-4444-8444-444444444444",
+).strip()
+
+MAX_CONVERSATION_TURNS = int(
+    os.getenv("MAX_CONVERSATION_TURNS", "8")
+)
 
 VAD_RMS_THRESHOLD = int(os.getenv("VAD_RMS_THRESHOLD", "350"))
 SILENCE_SECONDS = float(os.getenv("SILENCE_SECONDS", "1.2"))
@@ -81,6 +89,12 @@ GREETING_TEXT = (
     "Depois do sinal, diga seu nome e o produto que deseja consultar."
 )
 
+MULTITURN_GREETING_TEXT = (
+    "Olá. Aqui é o Carlos da RBK Distribuidora. "
+    "Vou fazer algumas perguntas para identificar corretamente a peça. "
+    "Depois do sinal, diga seu nome e o produto que procura."
+)
+
 SYSTEM_PROMPT = """
 Você é Carlos, vendedor técnico da RBK Distribuidora Floresta e Jardim.
 Atende clientes sobre peças e acessórios para roçadeiras, motosserras,
@@ -100,6 +114,64 @@ Regras obrigatórias:
 - Não diga que é humano.
 """.strip()
 
+MULTITURN_SYSTEM_PROMPT = """
+Você é Carlos, vendedor técnico virtual da RBK Distribuidora Floresta e Jardim.
+Conduza uma triagem técnica por telefone para identificar corretamente a peça
+antes de qualquer consulta de preço, estoque ou compatibilidade.
+
+Retorne SOMENTE um objeto JSON válido com esta estrutura:
+{
+  "resposta": "fala curta para o cliente",
+  "encerrar": false,
+  "levantamento_completo": false,
+  "motivo_encerramento": "",
+  "estado": {
+    "nome_cliente": null,
+    "produto": null,
+    "marca_maquina": null,
+    "modelo_maquina": null,
+    "quantidade": null,
+    "dados_tecnicos": {},
+    "observacoes": []
+  }
+}
+
+Regras obrigatórias:
+- Fale em português do Brasil.
+- A resposta deve ter no máximo duas frases curtas e 260 caracteres.
+- Faça somente uma pergunta por turno.
+- Não repita perguntas já respondidas.
+- Atualize e devolva o estado completo, preservando dados anteriores.
+- Não invente preço, estoque, prazo, código, aplicação ou compatibilidade.
+- O ERP ainda não está conectado neste piloto.
+- Se o cliente pedir para encerrar, disser que não tem interesse ou se
+  despedir, use encerrar=true e responda com educação.
+- Use levantamento_completo=true somente quando a peça estiver
+  tecnicamente identificada e a quantidade estiver informada.
+- Para corrente de motosserra, priorize passo, calibre, quantidade de elos
+  e quantidade desejada. Marca e modelo ajudam, mas não substituem essas
+  medidas quando houver dúvida de aplicação.
+- Para outras peças, obtenha produto, marca e modelo da máquina, quantidade
+  e ao menos um dado de identificação relevante, como código, medida,
+  referência, lado, diâmetro ou descrição específica.
+- Se o cliente não souber um dado, peça uma alternativa útil, como código
+  gravado na peça, medida ou foto para atendimento posterior.
+- Quando o levantamento estiver completo, confirme resumidamente os dados,
+  informe que preço e estoque serão consultados na próxima integração e
+  encerre.
+- Não use markdown, listas, emojis nem texto fora do JSON.
+""".strip()
+
+INITIAL_SALES_STATE = {
+    "nome_cliente": None,
+    "produto": None,
+    "marca_maquina": None,
+    "modelo_maquina": None,
+    "quantidade": None,
+    "dados_tecnicos": {},
+    "observacoes": [],
+}
+
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
@@ -116,6 +188,15 @@ class SessionStats:
     bytes_audio: int = 0
     frames_dtmf: int = 0
     max_rms: int = 0
+
+
+@dataclass
+class CaptureResult:
+    audio: bytes
+    reason: str
+    disconnected: bool
+    total_seconds: float
+    max_rms: int
 
 
 def pcm_rms(payload: bytes) -> int:
@@ -205,7 +286,7 @@ def transcribe_with_groq(pcm_audio: bytes) -> str:
             "Authorization": f"Bearer {GROQ_API_KEY}",
             "Accept": "application/json",
             "Content-Type": f"multipart/form-data; boundary={boundary}",
-            "User-Agent": "RBK-Vendedor-IA-Gateway/0.3.0",
+            "User-Agent": "RBK-Vendedor-IA-Gateway/0.4.0",
         },
     )
 
@@ -262,7 +343,7 @@ def generate_sales_reply(transcript: str) -> str:
             "Authorization": f"Bearer {GROQ_API_KEY}",
             "Accept": "application/json",
             "Content-Type": "application/json",
-            "User-Agent": "RBK-Vendedor-IA-Gateway/0.3.0",
+            "User-Agent": "RBK-Vendedor-IA-Gateway/0.4.0",
         },
     )
 
@@ -281,6 +362,185 @@ def generate_sales_reply(transcript: str) -> str:
         raise RuntimeError(
             f"Groq LLM retornou HTTP {error.code}: {body_error}"
         ) from error
+
+
+def bool_value(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {
+            "true",
+            "1",
+            "sim",
+            "yes",
+        }
+    return False
+
+
+def clean_state_text(value: object, max_length: int = 160) -> str | None:
+    if value is None:
+        return None
+    text_value = re.sub(r"\s+", " ", str(value)).strip()
+    if not text_value:
+        return None
+    return text_value[:max_length]
+
+
+def merge_sales_state(
+    current_state: dict,
+    incoming_state: object,
+) -> dict:
+    merged = {
+        "nome_cliente": current_state.get("nome_cliente"),
+        "produto": current_state.get("produto"),
+        "marca_maquina": current_state.get("marca_maquina"),
+        "modelo_maquina": current_state.get("modelo_maquina"),
+        "quantidade": current_state.get("quantidade"),
+        "dados_tecnicos": dict(
+            current_state.get("dados_tecnicos") or {}
+        ),
+        "observacoes": list(current_state.get("observacoes") or []),
+    }
+
+    if not isinstance(incoming_state, dict):
+        return merged
+
+    for key in (
+        "nome_cliente",
+        "produto",
+        "marca_maquina",
+        "modelo_maquina",
+        "quantidade",
+    ):
+        cleaned = clean_state_text(incoming_state.get(key))
+        if cleaned is not None:
+            merged[key] = cleaned
+
+    incoming_technical = incoming_state.get("dados_tecnicos")
+    if isinstance(incoming_technical, dict):
+        for key, value in incoming_technical.items():
+            clean_key = clean_state_text(key, max_length=80)
+            clean_value = clean_state_text(value, max_length=180)
+            if clean_key and clean_value:
+                merged["dados_tecnicos"][clean_key] = clean_value
+
+    incoming_notes = incoming_state.get("observacoes")
+    if isinstance(incoming_notes, list):
+        for item in incoming_notes:
+            cleaned = clean_state_text(item, max_length=180)
+            if cleaned and cleaned not in merged["observacoes"]:
+                merged["observacoes"].append(cleaned)
+
+    merged["observacoes"] = merged["observacoes"][-8:]
+    return merged
+
+
+def generate_multiturn_decision(
+    transcript: str,
+    current_state: dict,
+    history: list[dict[str, str]],
+) -> dict:
+    if not GROQ_API_KEY:
+        raise RuntimeError("GROQ_API_KEY não configurada.")
+
+    messages: list[dict[str, str]] = [
+        {
+            "role": "system",
+            "content": MULTITURN_SYSTEM_PROMPT,
+        }
+    ]
+    messages.extend(history[-10:])
+    messages.append(
+        {
+            "role": "user",
+            "content": (
+                "ESTADO ATUAL EM JSON:\n"
+                + json.dumps(
+                    current_state,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                + "\n\nNOVA FALA DO CLIENTE:\n"
+                + transcript
+                + "\n\nAtualize o estado e gere o próximo turno."
+            ),
+        }
+    )
+
+    body = json.dumps(
+        {
+            "model": GROQ_LLM_MODEL,
+            "messages": messages,
+            "temperature": 0.1,
+            "max_completion_tokens": 320,
+            "response_format": {
+                "type": "json_object",
+            },
+        }
+    ).encode("utf-8")
+
+    request = urllib.request.Request(
+        "https://api.groq.com/openai/v1/chat/completions",
+        data=body,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": "RBK-Vendedor-IA-Gateway/0.4.0",
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            payload = json.loads(
+                response.read().decode("utf-8", errors="replace")
+            )
+            raw_content = payload["choices"][0]["message"]["content"]
+            decision_data = json.loads(raw_content)
+    except urllib.error.HTTPError as error:
+        body_error = error.read().decode("utf-8", errors="replace")
+        raise RuntimeError(
+            f"Groq LLM retornou HTTP {error.code}: {body_error}"
+        ) from error
+    except (KeyError, IndexError, json.JSONDecodeError) as error:
+        raise RuntimeError(
+            f"Resposta estruturada inválida da Groq: {error}"
+        ) from error
+
+    reply = sanitize_llm_text(
+        str(decision_data.get("resposta") or "")
+    )
+    if not reply:
+        reply = (
+            "Não consegui definir a próxima pergunta técnica. "
+            "Vou encerrar este teste."
+        )
+
+    updated_state = merge_sales_state(
+        current_state,
+        decision_data.get("estado"),
+    )
+    complete = bool_value(
+        decision_data.get("levantamento_completo")
+    )
+    end_conversation = (
+        bool_value(decision_data.get("encerrar"))
+        or complete
+    )
+
+    return {
+        "resposta": reply,
+        "encerrar": end_conversation,
+        "levantamento_completo": complete,
+        "motivo_encerramento": clean_state_text(
+            decision_data.get("motivo_encerramento"),
+            max_length=160,
+        ) or "",
+        "estado": updated_state,
+    }
 
 
 def synthesize_piper_pcm8k(text: str) -> bytes:
@@ -468,6 +728,393 @@ async def send_tone(
             await asyncio.sleep(AUDIO_FRAME_MS / 1000)
 
 
+async def read_audiosocket_frame(
+    reader: asyncio.StreamReader,
+) -> tuple[int, bytes] | None:
+    header = await read_exactly_or_none(reader, HEADER_SIZE)
+    if header is None:
+        return None
+
+    frame_type = header[0]
+    payload_length = struct.unpack(">H", header[1:3])[0]
+    payload = await read_exactly_or_none(reader, payload_length)
+    if payload is None:
+        return None
+
+    return frame_type, payload
+
+
+async def capture_utterance(
+    reader: asyncio.StreamReader,
+    session_uuid: str,
+    stats: SessionStats,
+    discard_seconds: float,
+) -> CaptureResult:
+    captured_audio = bytearray()
+    pre_roll: deque[bytes] = deque()
+    pre_roll_duration = 0.0
+    speech_started = False
+    speech_duration = 0.0
+    silence_duration = 0.0
+    total_capture_duration = 0.0
+    local_max_rms = 0
+    remaining_discard = max(0.0, discard_seconds)
+
+    while True:
+        frame = await read_audiosocket_frame(reader)
+        if frame is None:
+            return CaptureResult(
+                audio=bytes(captured_audio),
+                reason="conexao_encerrada",
+                disconnected=True,
+                total_seconds=total_capture_duration,
+                max_rms=local_max_rms,
+            )
+
+        frame_type, payload = frame
+
+        if frame_type == TYPE_HANGUP:
+            logger.info(
+                "Hangup recebido durante captura: uuid=%s",
+                session_uuid,
+            )
+            return CaptureResult(
+                audio=bytes(captured_audio),
+                reason="hangup",
+                disconnected=True,
+                total_seconds=total_capture_duration,
+                max_rms=local_max_rms,
+            )
+
+        if frame_type == TYPE_DTMF:
+            stats.frames_dtmf += 1
+            digit = payload.decode("ascii", errors="replace")
+            logger.info(
+                "DTMF recebido: uuid=%s digito=%s",
+                session_uuid,
+                digit,
+            )
+            if digit == "#" and speech_started:
+                return CaptureResult(
+                    audio=bytes(captured_audio),
+                    reason="dtmf_finalizacao",
+                    disconnected=False,
+                    total_seconds=total_capture_duration,
+                    max_rms=local_max_rms,
+                )
+            continue
+
+        if frame_type == TYPE_ERROR:
+            logger.error(
+                "Erro recebido do Asterisk: uuid=%s codigo=%s",
+                session_uuid,
+                payload.hex() or "sem_codigo",
+            )
+            return CaptureResult(
+                audio=bytes(captured_audio),
+                reason="erro_asterisk",
+                disconnected=True,
+                total_seconds=total_capture_duration,
+                max_rms=local_max_rms,
+            )
+
+        if frame_type != TYPE_AUDIO_8KHZ:
+            continue
+
+        stats.frames_audio += 1
+        stats.bytes_audio += len(payload)
+        frame_duration = len(payload) / (
+            SAMPLE_RATE * SAMPLE_WIDTH
+        )
+
+        if remaining_discard > 0:
+            remaining_discard = max(
+                0.0,
+                remaining_discard - frame_duration,
+            )
+            continue
+
+        total_capture_duration += frame_duration
+        rms = pcm_rms(payload)
+        local_max_rms = max(local_max_rms, rms)
+        stats.max_rms = max(stats.max_rms, rms)
+        is_speech = rms >= VAD_RMS_THRESHOLD
+
+        if not speech_started:
+            pre_roll.append(payload)
+            pre_roll_duration += frame_duration
+
+            while (
+                pre_roll
+                and pre_roll_duration > PRE_ROLL_SECONDS
+            ):
+                removed = pre_roll.popleft()
+                pre_roll_duration -= len(removed) / (
+                    SAMPLE_RATE * SAMPLE_WIDTH
+                )
+
+            if is_speech:
+                speech_started = True
+                for buffered_frame in pre_roll:
+                    captured_audio.extend(buffered_frame)
+                pre_roll.clear()
+                pre_roll_duration = 0.0
+                speech_duration += frame_duration
+                silence_duration = 0.0
+                logger.info(
+                    "Início de fala detectado: uuid=%s rms=%s",
+                    session_uuid,
+                    rms,
+                )
+        else:
+            captured_audio.extend(payload)
+
+            if is_speech:
+                speech_duration += frame_duration
+                silence_duration = 0.0
+            else:
+                silence_duration += frame_duration
+
+            if (
+                speech_duration >= MIN_SPEECH_SECONDS
+                and silence_duration >= SILENCE_SECONDS
+            ):
+                return CaptureResult(
+                    audio=bytes(captured_audio),
+                    reason="silencio",
+                    disconnected=False,
+                    total_seconds=total_capture_duration,
+                    max_rms=local_max_rms,
+                )
+
+        if total_capture_duration >= MAX_CAPTURE_SECONDS:
+            return CaptureResult(
+                audio=bytes(captured_audio),
+                reason=(
+                    "tempo_maximo"
+                    if speech_started
+                    else "sem_fala"
+                ),
+                disconnected=False,
+                total_seconds=total_capture_duration,
+                max_rms=local_max_rms,
+            )
+
+
+async def handle_multiturn_session(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    session_uuid: str,
+    stats: SessionStats,
+) -> None:
+    state = json.loads(json.dumps(INITIAL_SALES_STATE))
+    history: list[dict[str, str]] = []
+    no_speech_attempts = 0
+
+    greeting_duration = await speak_text(
+        writer,
+        MULTITURN_GREETING_TEXT,
+        session_uuid,
+    )
+    await send_tone(writer)
+    discard_seconds = greeting_duration + 0.45
+
+    for turn_number in range(1, MAX_CONVERSATION_TURNS + 1):
+        logger.info(
+            "Aguardando turno do cliente: uuid=%s turno=%s/%s",
+            session_uuid,
+            turn_number,
+            MAX_CONVERSATION_TURNS,
+        )
+
+        capture = await capture_utterance(
+            reader=reader,
+            session_uuid=session_uuid,
+            stats=stats,
+            discard_seconds=discard_seconds,
+        )
+        discard_seconds = 0.0
+
+        if capture.disconnected:
+            logger.info(
+                "Conversa encerrada pelo canal: uuid=%s motivo=%s",
+                session_uuid,
+                capture.reason,
+            )
+            return
+
+        if not capture.audio:
+            no_speech_attempts += 1
+            logger.warning(
+                "Nenhuma fala no turno: uuid=%s turno=%s "
+                "tentativa=%s segundos=%.2f max_rms=%s",
+                session_uuid,
+                turn_number,
+                no_speech_attempts,
+                capture.total_seconds,
+                capture.max_rms,
+            )
+
+            if no_speech_attempts >= 2:
+                await speak_text(
+                    writer,
+                    (
+                        "Não consegui ouvir sua resposta. "
+                        "Vou encerrar este teste agora."
+                    ),
+                    session_uuid,
+                )
+                return
+
+            retry_duration = await speak_text(
+                writer,
+                (
+                    "Não ouvi sua resposta. "
+                    "Fale depois do sinal."
+                ),
+                session_uuid,
+            )
+            await send_tone(writer)
+            discard_seconds = retry_duration + 0.45
+            continue
+
+        no_speech_attempts = 0
+
+        logger.info(
+            "Enviando áudio para Groq: uuid=%s turno=%s motivo=%s "
+            "segundos=%.2f bytes=%s max_rms=%s",
+            session_uuid,
+            turn_number,
+            capture.reason,
+            len(capture.audio) / (SAMPLE_RATE * SAMPLE_WIDTH),
+            len(capture.audio),
+            capture.max_rms,
+        )
+
+        transcript = await asyncio.to_thread(
+            transcribe_with_groq,
+            capture.audio,
+        )
+        logger.info(
+            "TRANSCRICAO GROQ: uuid=%s turno=%s texto=%r",
+            session_uuid,
+            turn_number,
+            transcript,
+        )
+
+        if not transcript:
+            retry_duration = await speak_text(
+                writer,
+                (
+                    "Não consegui entender o áudio. "
+                    "Repita depois do sinal."
+                ),
+                session_uuid,
+            )
+            await send_tone(writer)
+            discard_seconds = retry_duration + 0.45
+            continue
+
+        try:
+            decision = await asyncio.to_thread(
+                generate_multiturn_decision,
+                transcript,
+                state,
+                history,
+            )
+        except Exception:
+            logger.exception(
+                "Falha na decisão multi-turno: uuid=%s turno=%s",
+                session_uuid,
+                turn_number,
+            )
+            await speak_text(
+                writer,
+                (
+                    "Tive uma falha ao processar sua resposta. "
+                    "Vou encerrar este teste agora."
+                ),
+                session_uuid,
+            )
+            return
+
+        state = decision["estado"]
+        reply = decision["resposta"]
+
+        history.append(
+            {
+                "role": "user",
+                "content": transcript,
+            }
+        )
+        history.append(
+            {
+                "role": "assistant",
+                "content": reply,
+            }
+        )
+
+        logger.info(
+            "DECISAO LLM: uuid=%s turno=%s encerrar=%s "
+            "completo=%s motivo=%r resposta=%r",
+            session_uuid,
+            turn_number,
+            decision["encerrar"],
+            decision["levantamento_completo"],
+            decision["motivo_encerramento"],
+            reply,
+        )
+        logger.info(
+            "ESTADO COMERCIAL: uuid=%s turno=%s estado=%s",
+            session_uuid,
+            turn_number,
+            json.dumps(
+                state,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+        )
+
+        reached_limit = (
+            turn_number >= MAX_CONVERSATION_TURNS
+            and not decision["encerrar"]
+        )
+
+        if reached_limit:
+            final_reply = (
+                "Registrei as informações disponíveis. "
+                "Este teste atingiu o limite de perguntas e será encerrado."
+            )
+            await speak_text(
+                writer,
+                final_reply,
+                session_uuid,
+            )
+            break
+
+        reply_duration = await speak_text(
+            writer,
+            reply,
+            session_uuid,
+        )
+
+        if decision["encerrar"]:
+            break
+
+        await send_tone(writer)
+        discard_seconds = reply_duration + 0.45
+
+    logger.info(
+        "CONVERSA FINAL: uuid=%s estado=%s",
+        session_uuid,
+        json.dumps(
+            state,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
+    )
+
+
 async def handle_client(
     reader: asyncio.StreamReader,
     writer: asyncio.StreamWriter,
@@ -528,6 +1175,8 @@ async def handle_client(
                     mode = "stt"
                 elif session_uuid == CONVERSATION_UUID:
                     mode = "conversation"
+                elif session_uuid == MULTITURN_UUID:
+                    mode = "multiturn"
                 else:
                     mode = "unknown"
 
@@ -554,6 +1203,16 @@ async def handle_client(
                     )
                     await send_tone(writer)
                     ignore_audio_seconds = greeting_duration + 0.45
+
+                elif mode == "multiturn":
+                    await handle_multiturn_session(
+                        reader=reader,
+                        writer=writer,
+                        session_uuid=session_uuid,
+                        stats=stats,
+                    )
+                    await send_frame(writer, TYPE_HANGUP)
+                    return
 
                 continue
 
@@ -806,15 +1465,18 @@ async def main() -> None:
         for sock in server.sockets or []
     )
     logger.info(
-        "Gateway de voz RBK v0.3.0 iniciado: endereços=%s "
+        "Gateway de voz RBK v0.4.0 iniciado: endereços=%s "
         "echo_uuid=%s stt_uuid=%s conversation_uuid=%s "
-        "modelo_stt=%s modelo_llm=%s",
+        "multiturn_uuid=%s modelo_stt=%s modelo_llm=%s "
+        "max_turnos=%s",
         addresses,
         ECHO_UUID,
         STT_UUID,
         CONVERSATION_UUID,
+        MULTITURN_UUID,
         GROQ_STT_MODEL,
         GROQ_LLM_MODEL,
+        MAX_CONVERSATION_TURNS,
     )
 
     stop_event = asyncio.Event()
