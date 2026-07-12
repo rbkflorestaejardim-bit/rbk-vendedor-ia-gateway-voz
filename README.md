@@ -1,21 +1,54 @@
-# RBK Vendedor IA — Gateway de Voz v0.5.1
+# RBK Vendedor IA — Gateway de Voz v0.5.2
 
-Correção de latência e interpretação técnica.
+Correção do comportamento comercial do Carlos.
 
-## Alterações
+## Nova regra principal
 
-- reduz o silêncio de fechamento do turno de 1,2 s para 0,70 s;
-- reduz a fala mínima válida para 0,45 s;
-- prioriza `whisper-large-v3` para maior precisão;
-- envia glossário técnico ao STT;
-- preserva códigos de modelos na transcrição;
-- adiciona classificação determinística de modelos Stihl `MS` e `FS`;
-- interpreta `carburador para MS 170` como:
-  - produto: carburador;
-  - tipo de máquina: motosserra;
-  - marca: Stihl;
-  - modelo: MS 170.
+Carlos é vendedor de peças, não mecânico.
 
-A classificação não confirma compatibilidade. Ela apenas estrutura corretamente o pedido antes das perguntas técnicas.
+Ao ouvir:
 
-A API Comercial 0.7.0 e o Asterisk não precisam ser alterados.
+```text
+Preciso de um carburador para MS 170.
+```
+
+o estado esperado é:
+
+```json
+{
+  "produto": "carburador",
+  "tipo_maquina": "motosserra",
+  "marca_maquina": "Stihl",
+  "modelo_maquina": "MS 170",
+  "acao_proxima": "buscar_produto",
+  "termo_busca": "carburador Stihl MS 170"
+}
+```
+
+A resposta será curta:
+
+```text
+Certo. Vou procurar carburador para Stihl MS 170 e consultar preço e
+disponibilidade.
+```
+
+## O que foi removido
+
+- perguntas sobre defeito;
+- perguntas sobre sintomas;
+- investigação mecânica;
+- exigência de quantidade antes de pesquisar;
+- repetição contínua do pedido;
+- perguntas técnicas sem uma ambiguidade real retornada pelo catálogo.
+
+## Fluxo
+
+- peça + modelo: preparar busca e encerrar a triagem;
+- peça sem marca/modelo: perguntar marca e modelo;
+- peça + marca sem modelo: perguntar somente o modelo;
+- código ou referência exata: preparar busca;
+- cliente pede encerramento: encerrar.
+
+O Olist ainda não está conectado ao gateway. Nesta versão, a ação
+`buscar_produto` e o `termo_busca` ficam estruturados e persistidos para a
+próxima etapa de integração.

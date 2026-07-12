@@ -162,9 +162,9 @@ Regras obrigatórias:
 """.strip()
 
 MULTITURN_SYSTEM_PROMPT = """
-Você é Carlos, vendedor técnico virtual da RBK Distribuidora Floresta e Jardim.
-Conduza uma triagem técnica por telefone para identificar corretamente a peça
-antes de qualquer consulta de preço, estoque ou compatibilidade.
+Você é Carlos, vendedor virtual de peças da RBK Distribuidora Floresta e
+Jardim. Sua função é entender qual peça o cliente pediu e preparar uma busca
+no catálogo. Você não é mecânico e não deve diagnosticar defeitos.
 
 Retorne SOMENTE um objeto JSON válido com esta estrutura:
 {
@@ -172,6 +172,8 @@ Retorne SOMENTE um objeto JSON válido com esta estrutura:
   "encerrar": false,
   "levantamento_completo": false,
   "motivo_encerramento": "",
+  "acao": "perguntar_dado|buscar_produto|encerrar",
+  "termo_busca": "",
   "estado": {
     "nome_cliente": null,
     "produto": null,
@@ -179,6 +181,8 @@ Retorne SOMENTE um objeto JSON válido com esta estrutura:
     "marca_maquina": null,
     "modelo_maquina": null,
     "quantidade": null,
+    "acao_proxima": null,
+    "termo_busca": null,
     "dados_tecnicos": {},
     "observacoes": []
   }
@@ -186,32 +190,31 @@ Retorne SOMENTE um objeto JSON válido com esta estrutura:
 
 Regras obrigatórias:
 - Fale em português do Brasil.
-- A resposta deve ter no máximo duas frases curtas e 260 caracteres.
-- Faça somente uma pergunta por turno.
-- Não repita perguntas já respondidas.
-- Atualize e devolva o estado completo, preservando dados anteriores.
-- Interprete a estrutura "peça para modelo" corretamente. Exemplo: em
-  "carburador para MS 170", produto=carburador, tipo_maquina=motosserra,
-  marca_maquina=Stihl e modelo_maquina=MS 170.
-- Códigos Stihl iniciados por MS identificam motosserras; não trate "MS"
-  como nome de pessoa, unidade de medida ou texto sem significado.
+- Seja direto e comercial.
+- Não faça diagnóstico mecânico.
+- Nunca pergunte qual defeito, problema ou sintoma a máquina apresenta quando
+  o cliente já informou qual peça deseja comprar.
+- Não pergunte por que o cliente quer trocar a peça.
+- Não repita em todos os turnos tudo que já entendeu.
+- Quando o cliente informar peça e modelo da máquina, a consulta está pronta.
+- Exemplo: "carburador para MS 170" significa produto=carburador,
+  tipo_maquina=motosserra, marca_maquina=Stihl, modelo_maquina=MS 170,
+  acao=buscar_produto e termo_busca="carburador Stihl MS 170".
+- Códigos Stihl iniciados por MS identificam motosserras.
+- Códigos Stihl iniciados por FS identificam roçadeiras.
+- Se faltar a peça, pergunte somente qual peça ele precisa.
+- Se houver a peça, mas faltar marca e modelo, pergunte somente marca e modelo.
+- Se houver marca, mas faltar o modelo, pergunte somente o modelo.
+- Código ou referência exata da peça também pode tornar a consulta pronta.
+- Quantidade não é obrigatória para iniciar a busca do produto.
+- Só faça pergunta adicional depois de uma busca real no catálogo indicar
+  ambiguidade. O ERP ainda não está conectado neste piloto.
 - Não invente preço, estoque, prazo, código, aplicação ou compatibilidade.
-- O ERP ainda não está conectado neste piloto.
-- Se o cliente pedir para encerrar, disser que não tem interesse ou se
-  despedir, use encerrar=true e responda com educação.
-- Use levantamento_completo=true somente quando a peça estiver
-  tecnicamente identificada e a quantidade estiver informada.
-- Para corrente de motosserra, priorize passo, calibre, quantidade de elos
-  e quantidade desejada. Marca e modelo ajudam, mas não substituem essas
-  medidas quando houver dúvida de aplicação.
-- Para outras peças, obtenha produto, marca e modelo da máquina, quantidade
-  e ao menos um dado de identificação relevante, como código, medida,
-  referência, lado, diâmetro ou descrição específica.
-- Se o cliente não souber um dado, peça uma alternativa útil, como código
-  gravado na peça, medida ou foto para atendimento posterior.
-- Quando o levantamento estiver completo, confirme resumidamente os dados,
-  informe que preço e estoque serão consultados na próxima integração e
-  encerre.
+- Quando a consulta estiver pronta, use levantamento_completo=true,
+  encerrar=true, acao=buscar_produto e responda apenas que vai procurar a peça
+  e consultar preço e disponibilidade.
+- Se o cliente pedir para encerrar, use encerrar=true e acao=encerrar.
+- A resposta deve ter no máximo duas frases curtas e 220 caracteres.
 - Não use markdown, listas, emojis nem texto fora do JSON.
 """.strip()
 
@@ -222,6 +225,8 @@ INITIAL_SALES_STATE = {
     "marca_maquina": None,
     "modelo_maquina": None,
     "quantidade": None,
+    "acao_proxima": None,
+    "termo_busca": None,
     "dados_tecnicos": {},
     "observacoes": [],
 }
@@ -342,7 +347,7 @@ def transcribe_with_groq(pcm_audio: bytes) -> str:
             "Authorization": f"Bearer {GROQ_API_KEY}",
             "Accept": "application/json",
             "Content-Type": f"multipart/form-data; boundary={boundary}",
-            "User-Agent": "RBK-Vendedor-IA-Gateway/0.5.1",
+            "User-Agent": "RBK-Vendedor-IA-Gateway/0.5.2",
         },
     )
 
@@ -399,7 +404,7 @@ def generate_sales_reply(transcript: str) -> str:
             "Authorization": f"Bearer {GROQ_API_KEY}",
             "Accept": "application/json",
             "Content-Type": "application/json",
-            "User-Agent": "RBK-Vendedor-IA-Gateway/0.5.1",
+            "User-Agent": "RBK-Vendedor-IA-Gateway/0.5.2",
         },
     )
 
@@ -455,6 +460,8 @@ def merge_sales_state(
         "marca_maquina": current_state.get("marca_maquina"),
         "modelo_maquina": current_state.get("modelo_maquina"),
         "quantidade": current_state.get("quantidade"),
+        "acao_proxima": current_state.get("acao_proxima"),
+        "termo_busca": current_state.get("termo_busca"),
         "dados_tecnicos": dict(
             current_state.get("dados_tecnicos") or {}
         ),
@@ -471,6 +478,8 @@ def merge_sales_state(
         "marca_maquina",
         "modelo_maquina",
         "quantidade",
+        "acao_proxima",
+        "termo_busca",
     ):
         cleaned = clean_state_text(incoming_state.get(key))
         if cleaned is not None:
@@ -585,6 +594,116 @@ def infer_domain_hints(transcript: str) -> dict:
     return hints
 
 
+
+def cliente_pediu_encerramento(transcript: str) -> bool:
+    normalized = transcript.casefold()
+    expressions = (
+        "não quero mais",
+        "nao quero mais",
+        "pode encerrar",
+        "pode desligar",
+        "não tenho interesse",
+        "nao tenho interesse",
+        "obrigado, tchau",
+        "obrigada, tchau",
+        "até mais",
+        "ate mais",
+    )
+    return any(expression in normalized for expression in expressions)
+
+
+def possui_referencia_exata(state: dict) -> bool:
+    technical = state.get("dados_tecnicos")
+    if not isinstance(technical, dict):
+        return False
+
+    reference_terms = (
+        "codigo",
+        "código",
+        "referencia",
+        "referência",
+        "part number",
+        "sku",
+    )
+
+    for key, value in technical.items():
+        normalized_key = str(key).casefold()
+        if (
+            any(term in normalized_key for term in reference_terms)
+            and value not in (None, "", [], {})
+        ):
+            return True
+
+    return False
+
+
+def montar_termo_busca_catalogo(state: dict) -> str:
+    parts = [
+        state.get("produto"),
+        state.get("marca_maquina"),
+        state.get("modelo_maquina"),
+    ]
+
+    technical = state.get("dados_tecnicos")
+    if isinstance(technical, dict):
+        for key, value in technical.items():
+            normalized_key = str(key).casefold()
+            if any(
+                term in normalized_key
+                for term in (
+                    "codigo",
+                    "código",
+                    "referencia",
+                    "referência",
+                    "part number",
+                    "sku",
+                )
+            ):
+                parts.append(value)
+
+    clean_parts: list[str] = []
+    for value in parts:
+        cleaned = clean_state_text(value, max_length=180)
+        if cleaned and cleaned not in clean_parts:
+            clean_parts.append(cleaned)
+
+    return " ".join(clean_parts)
+
+
+def consulta_catalogo_pronta(state: dict) -> bool:
+    product = clean_state_text(state.get("produto"))
+    model = clean_state_text(state.get("modelo_maquina"))
+    return bool(
+        product
+        and (
+            model
+            or possui_referencia_exata(state)
+        )
+    )
+
+
+def resposta_busca_catalogo(state: dict) -> str:
+    product = clean_state_text(state.get("produto")) or "peça"
+    brand = clean_state_text(state.get("marca_maquina"))
+    model = clean_state_text(state.get("modelo_maquina"))
+
+    application = " ".join(
+        value
+        for value in (brand, model)
+        if value
+    )
+
+    if application:
+        return (
+            f"Certo. Vou procurar {product} para {application} "
+            "e consultar preço e disponibilidade."
+        )
+
+    return (
+        f"Certo. Vou procurar {product} "
+        "e consultar preço e disponibilidade."
+    )
+
 def generate_multiturn_decision(
     transcript: str,
     current_state: dict,
@@ -639,7 +758,7 @@ def generate_multiturn_decision(
             "Authorization": f"Bearer {GROQ_API_KEY}",
             "Accept": "application/json",
             "Content-Type": "application/json",
-            "User-Agent": "RBK-Vendedor-IA-Gateway/0.5.1",
+            "User-Agent": "RBK-Vendedor-IA-Gateway/0.5.2",
         },
     )
 
@@ -663,11 +782,6 @@ def generate_multiturn_decision(
     reply = sanitize_llm_text(
         str(decision_data.get("resposta") or "")
     )
-    if not reply:
-        reply = (
-            "Não consegui definir a próxima pergunta técnica. "
-            "Vou encerrar este teste."
-        )
 
     updated_state = merge_sales_state(
         current_state,
@@ -677,22 +791,77 @@ def generate_multiturn_decision(
         updated_state,
         domain_hints,
     )
-    complete = bool_value(
-        decision_data.get("levantamento_completo")
-    )
-    end_conversation = (
+
+    # O cliente pode encerrar mesmo que os dados anteriores já fossem
+    # suficientes para uma consulta.
+    requested_end = (
         bool_value(decision_data.get("encerrar"))
-        or complete
+        or cliente_pediu_encerramento(transcript)
     )
+    requested_action = clean_state_text(
+        decision_data.get("acao"),
+        max_length=40,
+    )
+
+    if requested_end and requested_action == "encerrar":
+        if not reply:
+            reply = "Certo. Obrigado pelo contato."
+        updated_state["acao_proxima"] = "encerrar"
+        return {
+            "resposta": reply,
+            "encerrar": True,
+            "levantamento_completo": False,
+            "motivo_encerramento": clean_state_text(
+                decision_data.get("motivo_encerramento"),
+                max_length=160,
+            ) or "encerrado_pelo_cliente",
+            "acao": "encerrar",
+            "termo_busca": "",
+            "estado": updated_state,
+        }
+
+    # Regra comercial determinística: peça + modelo já é suficiente para
+    # iniciar a pesquisa no catálogo. Não pedir defeito, sintoma ou motivo.
+    if consulta_catalogo_pronta(updated_state):
+        search_term = montar_termo_busca_catalogo(updated_state)
+        updated_state["acao_proxima"] = "buscar_produto"
+        updated_state["termo_busca"] = search_term
+
+        return {
+            "resposta": resposta_busca_catalogo(updated_state),
+            "encerrar": True,
+            "levantamento_completo": True,
+            "motivo_encerramento": "consulta_catalogo_pronta",
+            "acao": "buscar_produto",
+            "termo_busca": search_term,
+            "estado": updated_state,
+        }
+
+    product = clean_state_text(updated_state.get("produto"))
+    brand = clean_state_text(updated_state.get("marca_maquina"))
+    model = clean_state_text(updated_state.get("modelo_maquina"))
+
+    updated_state["acao_proxima"] = "perguntar_dado"
+    updated_state["termo_busca"] = None
+
+    if not product:
+        reply = "Qual peça você precisa?"
+    elif not model and not brand:
+        reply = "Qual é a marca e o modelo da máquina?"
+    elif not model:
+        reply = "Qual é o modelo da máquina?"
+    else:
+        reply = (
+            "Qual é o código ou a referência exata da peça?"
+        )
 
     return {
         "resposta": reply,
-        "encerrar": end_conversation,
-        "levantamento_completo": complete,
-        "motivo_encerramento": clean_state_text(
-            decision_data.get("motivo_encerramento"),
-            max_length=160,
-        ) or "",
+        "encerrar": False,
+        "levantamento_completo": False,
+        "motivo_encerramento": "",
+        "acao": "perguntar_dado",
+        "termo_busca": "",
         "estado": updated_state,
     }
 
@@ -780,7 +949,7 @@ def persistir_conversa_na_api(payload: dict) -> dict | None:
                 "X-API-Key": API_COMERCIAL_KEY,
                 "Accept": "application/json",
                 "Content-Type": "application/json",
-                "User-Agent": "RBK-Vendedor-IA-Gateway/0.5.1",
+                "User-Agent": "RBK-Vendedor-IA-Gateway/0.5.2",
             },
         )
 
@@ -1405,11 +1574,13 @@ async def handle_multiturn_session(
 
         logger.info(
             "DECISAO LLM: uuid=%s turno=%s encerrar=%s "
-            "completo=%s motivo=%r resposta=%r",
+            "completo=%s acao=%s termo_busca=%r motivo=%r resposta=%r",
             session_uuid,
             turn_number,
             decision["encerrar"],
             complete,
+            decision.get("acao"),
+            decision.get("termo_busca"),
             decision["motivo_encerramento"],
             reply,
         )
@@ -1908,7 +2079,7 @@ async def main() -> None:
         for sock in server.sockets or []
     )
     logger.info(
-        "Gateway de voz RBK v0.5.1 iniciado: endereços=%s "
+        "Gateway de voz RBK v0.5.2 iniciado: endereços=%s "
         "echo_uuid=%s stt_uuid=%s conversation_uuid=%s "
         "multiturn_uuid=%s modelo_stt=%s modelo_llm=%s "
         "max_turnos=%s persistencia_ativa=%s "
