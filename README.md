@@ -1,36 +1,12 @@
-# RBK Vendedor IA — Gateway de Voz v0.6.0
+# RBK Vendedor IA — Gateway de Voz v0.6.1
 
-O ramal `605` passa a consultar o catálogo real da API Comercial.
+Carlos só oferece ao cliente produtos com preço válido e estoque disponível.
 
-## Fluxo
+Produtos compatíveis sem preço ou sem estoque permanecem registrados
+internamente, mas não são apresentados como opção de compra.
 
-```text
-cliente pede a peça
-→ Groq identifica produto, marca e modelo
-→ gateway chama /olist/produtos/pesquisar
-→ API pesquisa o catálogo sincronizado do Olist
-→ Carlos informa descrição, preço e estoque
-```
+Exemplo: se o SKU 12933 tem preço e estoque e o SKU 2452 não tem nenhum dos
+dois, Carlos informa somente o SKU 12933.
 
-## Comportamento
-
-- Um produto: Carlos informa código, descrição, preço e estoque.
-- Vários produtos: Carlos apresenta as duas primeiras opções e pede
-  “primeira” ou “segunda”. O cliente também pode informar o SKU.
-- Nenhum produto: Carlos pergunta uma vez pelo código ou referência.
-- Erro de API: registra a solicitação para continuidade.
-
-Preço e estoque vêm exclusivamente da API Comercial. O resultado e a opção
-selecionada são persistidos junto à chamada.
-
-## Variáveis novas
-
-```env
-CONSULTA_CATALOGO_ATIVA=true
-CONSULTA_CATALOGO_LIMITE=5
-CONSULTA_CATALOGO_TIMEOUT=25
-MAX_OPCOES_FALADAS=2
-MAX_TENTATIVAS_CATALOGO=2
-```
-
-Não há alteração no Asterisk nem na API Comercial nesta etapa.
+Se nenhum produto compatível tiver preço e estoque, Carlos informa que não há
+opção disponível e registra a solicitação para atendimento posterior.

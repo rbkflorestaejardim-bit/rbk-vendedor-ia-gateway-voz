@@ -374,7 +374,7 @@ def transcribe_with_groq(pcm_audio: bytes) -> str:
             "Authorization": f"Bearer {GROQ_API_KEY}",
             "Accept": "application/json",
             "Content-Type": f"multipart/form-data; boundary={boundary}",
-            "User-Agent": "RBK-Vendedor-IA-Gateway/0.6.0",
+            "User-Agent": "RBK-Vendedor-IA-Gateway/0.6.1",
         },
     )
 
@@ -431,7 +431,7 @@ def generate_sales_reply(transcript: str) -> str:
             "Authorization": f"Bearer {GROQ_API_KEY}",
             "Accept": "application/json",
             "Content-Type": "application/json",
-            "User-Agent": "RBK-Vendedor-IA-Gateway/0.6.0",
+            "User-Agent": "RBK-Vendedor-IA-Gateway/0.6.1",
         },
     )
 
@@ -801,7 +801,7 @@ def generate_multiturn_decision(
             "Authorization": f"Bearer {GROQ_API_KEY}",
             "Accept": "application/json",
             "Content-Type": "application/json",
-            "User-Agent": "RBK-Vendedor-IA-Gateway/0.6.0",
+            "User-Agent": "RBK-Vendedor-IA-Gateway/0.6.1",
         },
     )
 
@@ -966,7 +966,7 @@ def consultar_catalogo_na_api(estado: dict) -> dict:
         headers={
             "X-API-Key": API_COMERCIAL_KEY,
             "Accept": "application/json",
-            "User-Agent": "RBK-Vendedor-IA-Gateway/0.6.0",
+            "User-Agent": "RBK-Vendedor-IA-Gateway/0.6.1",
         },
     )
 
@@ -1267,9 +1267,42 @@ def identificar_selecao_catalogo(
     return None
 
 
+
+def filtrar_opcoes_comercializaveis(
+    opcoes: list[dict],
+) -> list[dict]:
+    comercializaveis: list[dict] = []
+
+    for opcao in opcoes:
+        preco = numero_decimal(opcao.get("preco_efetivo"))
+        estoque = opcao.get("estoque")
+        if not isinstance(estoque, dict):
+            estoque = {}
+
+        disponivel = numero_decimal(
+            estoque.get("disponivel")
+        )
+
+        tem_preco = bool(
+            opcao.get("preco_disponivel")
+            and preco is not None
+            and preco > 0
+        )
+        tem_estoque = bool(
+            opcao.get("tem_estoque")
+            and disponivel is not None
+            and disponivel > 0
+        )
+
+        if tem_preco and tem_estoque:
+            comercializaveis.append(opcao)
+
+    return comercializaveis
+
 def resumo_consulta_catalogo(
     payload: dict,
-    opcoes: list[dict],
+    opcoes_recebidas: list[dict],
+    opcoes_comercializaveis: list[dict],
 ) -> dict:
     consulta = payload.get("consulta")
     if not isinstance(consulta, dict):
@@ -1288,7 +1321,23 @@ def resumo_consulta_catalogo(
         "catalogo_sincronizado_em": consulta.get(
             "catalogo_sincronizado_em"
         ),
-        "opcoes": opcoes,
+        "quantidade_opcoes_recebidas": len(
+            opcoes_recebidas
+        ),
+        "quantidade_opcoes_comercializaveis": len(
+            opcoes_comercializaveis
+        ),
+        "quantidade_opcoes_descartadas": max(
+            0,
+            len(opcoes_recebidas)
+            - len(opcoes_comercializaveis),
+        ),
+        "opcoes_comercializaveis": opcoes_comercializaveis,
+        "opcoes_descartadas": [
+            opcao
+            for opcao in opcoes_recebidas
+            if opcao not in opcoes_comercializaveis
+        ],
     }
 
 def montar_resumo_deterministico(
@@ -1391,7 +1440,7 @@ def persistir_conversa_na_api(payload: dict) -> dict | None:
                 "X-API-Key": API_COMERCIAL_KEY,
                 "Accept": "application/json",
                 "Content-Type": "application/json",
-                "User-Agent": "RBK-Vendedor-IA-Gateway/0.6.0",
+                "User-Agent": "RBK-Vendedor-IA-Gateway/0.6.1",
             },
         )
 
@@ -2144,8 +2193,15 @@ async def handle_multiturn_session(
                     consultar_catalogo_na_api,
                     state,
                 )
-                catalogo_opcoes = obter_opcoes_catalogo(
-                    catalogo_payload
+                catalogo_opcoes_recebidas = (
+                    obter_opcoes_catalogo(
+                        catalogo_payload
+                    )
+                )
+                catalogo_opcoes = (
+                    filtrar_opcoes_comercializaveis(
+                        catalogo_opcoes_recebidas
+                    )
                 )
                 state["catalogo_status"] = (
                     catalogo_payload.get("status")
@@ -2155,17 +2211,25 @@ async def handle_multiturn_session(
                 state["ultima_consulta_catalogo"] = (
                     resumo_consulta_catalogo(
                         catalogo_payload,
+                        catalogo_opcoes_recebidas,
                         catalogo_opcoes,
                     )
                 )
 
                 logger.info(
                     "CONSULTA CATALOGO: uuid=%s turno=%s "
-                    "status=%s quantidade=%s consulta_id=%s",
+                    "status=%s recebidas=%s comercializaveis=%s "
+                    "descartadas=%s consulta_id=%s",
                     session_uuid,
                     turn_number,
                     state["catalogo_status"],
+                    len(catalogo_opcoes_recebidas),
                     len(catalogo_opcoes),
+                    max(
+                        0,
+                        len(catalogo_opcoes_recebidas)
+                        - len(catalogo_opcoes),
+                    ),
                     catalogo_payload.get("consulta_id"),
                 )
 
@@ -2199,9 +2263,37 @@ async def handle_multiturn_session(
                 break
 
             if not catalogo_opcoes:
+                complete = False
+
+                if catalogo_opcoes_recebidas:
+                    state["catalogo_status"] = (
+                        "sem_opcao_comercializavel"
+                    )
+                    state["acao_proxima"] = (
+                        "atendimento_posterior"
+                    )
+                    resposta_catalogo = (
+                        "Encontrei cadastro compatível, mas nenhuma "
+                        "opção está disponível com preço e estoque. "
+                        "A solicitação ficou registrada para atendimento."
+                    )
+                    recorded_turns[-1]["agente"] = (
+                        f"{resposta_espera} {resposta_catalogo}"
+                    )
+                    history[-1]["content"] = (
+                        recorded_turns[-1]["agente"]
+                    )
+                    await speak_text(
+                        writer,
+                        resposta_catalogo,
+                        session_uuid,
+                    )
+                    end_reason = "sem_opcao_comercializavel"
+                    result = "sem_opcao_comercializavel"
+                    break
+
                 state["catalogo_status"] = "nao_encontrado"
                 state["acao_proxima"] = "perguntar_referencia"
-                complete = False
 
                 if (
                     catalogo_tentativas
@@ -2789,7 +2881,7 @@ async def main() -> None:
         for sock in server.sockets or []
     )
     logger.info(
-        "Gateway de voz RBK v0.6.0 iniciado: endereços=%s "
+        "Gateway de voz RBK v0.6.1 iniciado: endereços=%s "
         "echo_uuid=%s stt_uuid=%s conversation_uuid=%s "
         "multiturn_uuid=%s modelo_stt=%s modelo_llm=%s "
         "max_turnos=%s persistencia_ativa=%s "
