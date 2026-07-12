@@ -10,7 +10,9 @@ import signal
 import struct
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
+import unicodedata
 import uuid
 import wave
 from collections import deque
@@ -108,6 +110,23 @@ PERSISTENCIA_NUMERO_DESTINO = os.getenv(
     "605",
 ).strip()
 
+CONSULTA_CATALOGO_ATIVA = os.getenv(
+    "CONSULTA_CATALOGO_ATIVA",
+    "false",
+).strip().lower() in {"1", "true", "sim", "yes"}
+CONSULTA_CATALOGO_LIMITE = int(
+    os.getenv("CONSULTA_CATALOGO_LIMITE", "5")
+)
+CONSULTA_CATALOGO_TIMEOUT = int(
+    os.getenv("CONSULTA_CATALOGO_TIMEOUT", "25")
+)
+MAX_OPCOES_FALADAS = int(
+    os.getenv("MAX_OPCOES_FALADAS", "2")
+)
+MAX_TENTATIVAS_CATALOGO = int(
+    os.getenv("MAX_TENTATIVAS_CATALOGO", "2")
+)
+
 VAD_RMS_THRESHOLD = int(os.getenv("VAD_RMS_THRESHOLD", "350"))
 SILENCE_SECONDS = float(os.getenv("SILENCE_SECONDS", "0.70"))
 MIN_SPEECH_SECONDS = float(os.getenv("MIN_SPEECH_SECONDS", "0.45"))
@@ -138,8 +157,8 @@ GREETING_TEXT = (
 
 MULTITURN_GREETING_TEXT = (
     "Olá. Aqui é o Carlos da RBK Distribuidora. "
-    "Vou fazer algumas perguntas para identificar corretamente a peça. "
-    "Depois do sinal, diga seu nome e o produto que procura."
+    "Diga a peça que procura e a marca e o modelo da máquina. "
+    "Depois do sinal, pode falar."
 )
 
 SYSTEM_PROMPT = """
@@ -208,11 +227,13 @@ Regras obrigatórias:
 - Código ou referência exata da peça também pode tornar a consulta pronta.
 - Quantidade não é obrigatória para iniciar a busca do produto.
 - Só faça pergunta adicional depois de uma busca real no catálogo indicar
-  ambiguidade. O ERP ainda não está conectado neste piloto.
+  ambiguidade.
 - Não invente preço, estoque, prazo, código, aplicação ou compatibilidade.
+- Preço e estoque serão informados exclusivamente pelo retorno da API
+  Comercial; nunca crie esses valores.
 - Quando a consulta estiver pronta, use levantamento_completo=true,
-  encerrar=true, acao=buscar_produto e responda apenas que vai procurar a peça
-  e consultar preço e disponibilidade.
+  encerrar=true, acao=buscar_produto e responda apenas que vai consultar a
+  peça, o preço e a disponibilidade.
 - Se o cliente pedir para encerrar, use encerrar=true e acao=encerrar.
 - A resposta deve ter no máximo duas frases curtas e 220 caracteres.
 - Não use markdown, listas, emojis nem texto fora do JSON.
@@ -227,6 +248,12 @@ INITIAL_SALES_STATE = {
     "quantidade": None,
     "acao_proxima": None,
     "termo_busca": None,
+    "catalogo_status": None,
+    "catalogo_tentativas": 0,
+    "aguardando_selecao_catalogo": False,
+    "catalogo_opcoes": [],
+    "produto_selecionado": None,
+    "ultima_consulta_catalogo": None,
     "dados_tecnicos": {},
     "observacoes": [],
 }
@@ -347,7 +374,7 @@ def transcribe_with_groq(pcm_audio: bytes) -> str:
             "Authorization": f"Bearer {GROQ_API_KEY}",
             "Accept": "application/json",
             "Content-Type": f"multipart/form-data; boundary={boundary}",
-            "User-Agent": "RBK-Vendedor-IA-Gateway/0.5.2",
+            "User-Agent": "RBK-Vendedor-IA-Gateway/0.6.0",
         },
     )
 
@@ -404,7 +431,7 @@ def generate_sales_reply(transcript: str) -> str:
             "Authorization": f"Bearer {GROQ_API_KEY}",
             "Accept": "application/json",
             "Content-Type": "application/json",
-            "User-Agent": "RBK-Vendedor-IA-Gateway/0.5.2",
+            "User-Agent": "RBK-Vendedor-IA-Gateway/0.6.0",
         },
     )
 
@@ -462,6 +489,22 @@ def merge_sales_state(
         "quantidade": current_state.get("quantidade"),
         "acao_proxima": current_state.get("acao_proxima"),
         "termo_busca": current_state.get("termo_busca"),
+        "catalogo_status": current_state.get("catalogo_status"),
+        "catalogo_tentativas": int(
+            current_state.get("catalogo_tentativas") or 0
+        ),
+        "aguardando_selecao_catalogo": bool(
+            current_state.get("aguardando_selecao_catalogo")
+        ),
+        "catalogo_opcoes": list(
+            current_state.get("catalogo_opcoes") or []
+        ),
+        "produto_selecionado": current_state.get(
+            "produto_selecionado"
+        ),
+        "ultima_consulta_catalogo": current_state.get(
+            "ultima_consulta_catalogo"
+        ),
         "dados_tecnicos": dict(
             current_state.get("dados_tecnicos") or {}
         ),
@@ -758,7 +801,7 @@ def generate_multiturn_decision(
             "Authorization": f"Bearer {GROQ_API_KEY}",
             "Accept": "application/json",
             "Content-Type": "application/json",
-            "User-Agent": "RBK-Vendedor-IA-Gateway/0.5.2",
+            "User-Agent": "RBK-Vendedor-IA-Gateway/0.6.0",
         },
     )
 
@@ -866,6 +909,388 @@ def generate_multiturn_decision(
     }
 
 
+
+def normalizar_texto_catalogo(valor: object) -> str:
+    texto = unicodedata.normalize(
+        "NFKD",
+        str(valor or ""),
+    )
+    texto = "".join(
+        caractere
+        for caractere in texto
+        if not unicodedata.combining(caractere)
+    )
+    texto = texto.casefold()
+    texto = re.sub(r"[^a-z0-9]+", " ", texto)
+    return re.sub(r"\s+", " ", texto).strip()
+
+
+def consultar_catalogo_na_api(estado: dict) -> dict:
+    if not CONSULTA_CATALOGO_ATIVA:
+        raise RuntimeError("CONSULTA_CATALOGO_ATIVA está desativada.")
+
+    ausentes = [
+        nome
+        for nome, valor in {
+            "API_COMERCIAL_URL": API_COMERCIAL_URL,
+            "API_COMERCIAL_KEY": API_COMERCIAL_KEY,
+        }.items()
+        if not valor
+    ]
+    if ausentes:
+        raise RuntimeError(
+            "Consulta ao catálogo com configuração incompleta: "
+            + ", ".join(ausentes)
+        )
+
+    parametros = {
+        "termo": estado.get("termo_busca"),
+        "produto": estado.get("produto"),
+        "marca": estado.get("marca_maquina"),
+        "modelo": estado.get("modelo_maquina"),
+        "limite": max(1, min(CONSULTA_CATALOGO_LIMITE, 10)),
+    }
+    parametros = {
+        chave: valor
+        for chave, valor in parametros.items()
+        if valor not in (None, "")
+    }
+
+    url = (
+        f"{API_COMERCIAL_URL}/olist/produtos/pesquisar?"
+        + urllib.parse.urlencode(parametros)
+    )
+    request = urllib.request.Request(
+        url,
+        method="GET",
+        headers={
+            "X-API-Key": API_COMERCIAL_KEY,
+            "Accept": "application/json",
+            "User-Agent": "RBK-Vendedor-IA-Gateway/0.6.0",
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(
+            request,
+            timeout=CONSULTA_CATALOGO_TIMEOUT,
+        ) as response:
+            payload = json.loads(
+                response.read().decode(
+                    "utf-8",
+                    errors="replace",
+                )
+            )
+    except urllib.error.HTTPError as error:
+        body_error = error.read().decode(
+            "utf-8",
+            errors="replace",
+        )
+        raise RuntimeError(
+            f"API Comercial retornou HTTP {error.code}: "
+            f"{body_error[:1200]}"
+        ) from error
+    except (
+        urllib.error.URLError,
+        TimeoutError,
+        json.JSONDecodeError,
+    ) as error:
+        raise RuntimeError(
+            f"Falha ao consultar o catálogo: {error}"
+        ) from error
+
+    if not isinstance(payload, dict):
+        raise RuntimeError(
+            "A API Comercial retornou um formato inválido."
+        )
+
+    return payload
+
+
+def normalizar_opcao_catalogo(
+    item: object,
+    indice: int,
+) -> dict | None:
+    if not isinstance(item, dict):
+        return None
+
+    descricao = clean_state_text(
+        item.get("descricao"),
+        max_length=240,
+    )
+    if not descricao:
+        return None
+
+    estoque = item.get("estoque")
+    if not isinstance(estoque, dict):
+        estoque = {}
+
+    return {
+        "indice": indice,
+        "id": item.get("id"),
+        "sku": clean_state_text(
+            item.get("sku"),
+            max_length=80,
+        ),
+        "descricao": descricao,
+        "preco": item.get("preco"),
+        "preco_promocional": item.get(
+            "preco_promocional"
+        ),
+        "preco_efetivo": item.get("preco_efetivo"),
+        "preco_disponivel": bool(
+            item.get("preco_disponivel")
+        ),
+        "tem_estoque": bool(item.get("tem_estoque")),
+        "situacao_comercial": item.get(
+            "situacao_comercial"
+        ),
+        "estoque": {
+            "saldo": estoque.get("saldo"),
+            "reservado": estoque.get("reservado"),
+            "disponivel": estoque.get("disponivel"),
+            "localizacao": estoque.get("localizacao"),
+            "status": estoque.get("status"),
+        },
+    }
+
+
+def obter_opcoes_catalogo(payload: dict) -> list[dict]:
+    resultados = payload.get("resultados")
+    if not isinstance(resultados, list):
+        return []
+
+    opcoes: list[dict] = []
+    for indice, item in enumerate(resultados, start=1):
+        opcao = normalizar_opcao_catalogo(
+            item,
+            indice,
+        )
+        if opcao is not None:
+            opcoes.append(opcao)
+
+    return opcoes
+
+
+def numero_decimal(valor: object) -> float | None:
+    if valor in (None, ""):
+        return None
+
+    try:
+        return float(valor)
+    except (TypeError, ValueError):
+        return None
+
+
+def formatar_preco_para_voz(valor: object) -> str:
+    numero = numero_decimal(valor)
+    if numero is None or numero <= 0:
+        return "preço não cadastrado"
+
+    total_centavos = int(round(numero * 100))
+    reais = total_centavos // 100
+    centavos = total_centavos % 100
+
+    if reais == 1:
+        texto = "1 real"
+    else:
+        texto = f"{reais} reais"
+
+    if centavos == 1:
+        texto += " e 1 centavo"
+    elif centavos > 1:
+        texto += f" e {centavos} centavos"
+
+    return texto
+
+
+def formatar_estoque_para_voz(opcao: dict) -> str:
+    estoque = opcao.get("estoque")
+    if not isinstance(estoque, dict):
+        return "estoque não informado"
+
+    disponivel = numero_decimal(
+        estoque.get("disponivel")
+    )
+    if disponivel is None:
+        return "estoque não informado"
+    if disponivel <= 0:
+        return "sem estoque disponível"
+    if disponivel == 1:
+        return "1 unidade disponível"
+
+    quantidade = (
+        int(disponivel)
+        if disponivel.is_integer()
+        else disponivel
+    )
+    return f"{quantidade} unidades disponíveis"
+
+
+def descricao_para_voz(valor: object) -> str:
+    descricao = re.sub(
+        r"\s+",
+        " ",
+        str(valor or ""),
+    ).strip()
+    descricao = re.sub(
+        r"(?<=\d)\s*/\s*(?=\d)",
+        " ou ",
+        descricao,
+    )
+    descricao = descricao.replace("-", " ")
+    return descricao.casefold()
+
+
+def frase_opcao_catalogo(
+    opcao: dict,
+    incluir_rotulo: bool = False,
+) -> str:
+    partes: list[str] = []
+
+    if incluir_rotulo:
+        nomes = {
+            1: "primeira opção",
+            2: "segunda opção",
+            3: "terceira opção",
+        }
+        partes.append(
+            nomes.get(
+                int(opcao.get("indice") or 0),
+                f"opção {opcao.get('indice')}",
+            )
+        )
+
+    sku = clean_state_text(
+        opcao.get("sku"),
+        max_length=80,
+    )
+    if sku:
+        partes.append(f"código {sku}")
+
+    partes.append(
+        descricao_para_voz(opcao.get("descricao"))
+    )
+    partes.append(
+        formatar_preco_para_voz(
+            opcao.get("preco_efetivo")
+        )
+    )
+    partes.append(formatar_estoque_para_voz(opcao))
+
+    return ", ".join(
+        parte
+        for parte in partes
+        if parte
+    )
+
+
+def resposta_multiplas_opcoes(
+    opcoes: list[dict],
+) -> str:
+    quantidade = min(
+        len(opcoes),
+        max(1, MAX_OPCOES_FALADAS),
+    )
+    faladas = opcoes[:quantidade]
+
+    introducao = (
+        "Encontrei duas opções."
+        if quantidade == 2
+        else f"Encontrei {quantidade} opções."
+    )
+    detalhes = ". ".join(
+        frase_opcao_catalogo(
+            opcao,
+            incluir_rotulo=True,
+        )
+        for opcao in faladas
+    )
+    pergunta = (
+        "Diga primeira ou segunda."
+        if quantidade == 2
+        else "Diga o número da opção."
+    )
+
+    return f"{introducao} {detalhes}. {pergunta}"
+
+
+def identificar_selecao_catalogo(
+    transcript: str,
+    opcoes: list[dict],
+) -> dict | None:
+    normalizado = normalizar_texto_catalogo(transcript)
+
+    palavras_indices = {
+        "primeira": 1,
+        "primeiro": 1,
+        "opcao um": 1,
+        "opcao 1": 1,
+        "segunda": 2,
+        "segundo": 2,
+        "opcao dois": 2,
+        "opcao 2": 2,
+        "terceira": 3,
+        "terceiro": 3,
+        "opcao tres": 3,
+        "opcao 3": 3,
+    }
+
+    indice_escolhido: int | None = None
+
+    for expressao, indice in palavras_indices.items():
+        if expressao in normalizado:
+            indice_escolhido = indice
+            break
+
+    if indice_escolhido is None:
+        match = re.search(
+            r"\b(?:opcao\s*)?([1-9])\b",
+            normalizado,
+        )
+        if match:
+            indice_escolhido = int(match.group(1))
+
+    if indice_escolhido is not None:
+        for opcao in opcoes:
+            if int(opcao.get("indice") or 0) == indice_escolhido:
+                return opcao
+
+    for opcao in opcoes:
+        sku = normalizar_texto_catalogo(opcao.get("sku"))
+        if sku and re.search(
+            rf"\b{re.escape(sku)}\b",
+            normalizado,
+        ):
+            return opcao
+
+    return None
+
+
+def resumo_consulta_catalogo(
+    payload: dict,
+    opcoes: list[dict],
+) -> dict:
+    consulta = payload.get("consulta")
+    if not isinstance(consulta, dict):
+        consulta = {}
+
+    return {
+        "consulta_id": payload.get("consulta_id"),
+        "status": payload.get("status"),
+        "quantidade_resultados": payload.get(
+            "quantidade_resultados"
+        ),
+        "quantidade_compativeis_localizados": payload.get(
+            "quantidade_compativeis_localizados"
+        ),
+        "modo_busca": consulta.get("modo_busca"),
+        "catalogo_sincronizado_em": consulta.get(
+            "catalogo_sincronizado_em"
+        ),
+        "opcoes": opcoes,
+    }
+
 def montar_resumo_deterministico(
     estado: dict,
     levantamento_completo: bool,
@@ -885,6 +1310,23 @@ def montar_resumo_deterministico(
     for rotulo, valor in campos:
         if valor not in (None, "", [], {}):
             partes.append(f"{rotulo}: {valor}")
+
+    produto_selecionado = estado.get(
+        "produto_selecionado"
+    )
+    if isinstance(produto_selecionado, dict):
+        sku_selecionado = produto_selecionado.get("sku")
+        descricao_selecionada = produto_selecionado.get(
+            "descricao"
+        )
+        if sku_selecionado:
+            partes.append(
+                f"SKU selecionado: {sku_selecionado}"
+            )
+        if descricao_selecionada:
+            partes.append(
+                f"Produto selecionado: {descricao_selecionada}"
+            )
 
     dados_tecnicos = estado.get("dados_tecnicos")
     if isinstance(dados_tecnicos, dict) and dados_tecnicos:
@@ -949,7 +1391,7 @@ def persistir_conversa_na_api(payload: dict) -> dict | None:
                 "X-API-Key": API_COMERCIAL_KEY,
                 "Accept": "application/json",
                 "Content-Type": "application/json",
-                "User-Agent": "RBK-Vendedor-IA-Gateway/0.5.2",
+                "User-Agent": "RBK-Vendedor-IA-Gateway/0.6.0",
             },
         )
 
@@ -1512,6 +1954,87 @@ async def handle_multiturn_session(
             discard_seconds = retry_duration + 0.45
             continue
 
+        if state.get("aguardando_selecao_catalogo"):
+            opcoes_selecao = list(
+                state.get("catalogo_opcoes") or []
+            )[:max(1, MAX_OPCOES_FALADAS)]
+            opcao_escolhida = identificar_selecao_catalogo(
+                transcript,
+                opcoes_selecao,
+            )
+
+            if opcao_escolhida is None:
+                resposta_selecao = (
+                    "Não identifiquei a opção. "
+                    "Diga primeira ou segunda, ou informe o código."
+                )
+                recorded_turns.append(
+                    {
+                        "numero": turn_number,
+                        "cliente": transcript,
+                        "agente": resposta_selecao,
+                    }
+                )
+                history.append(
+                    {
+                        "role": "user",
+                        "content": transcript,
+                    }
+                )
+                history.append(
+                    {
+                        "role": "assistant",
+                        "content": resposta_selecao,
+                    }
+                )
+                resposta_duracao = await speak_text(
+                    writer,
+                    resposta_selecao,
+                    session_uuid,
+                )
+                await send_tone(writer)
+                discard_seconds = resposta_duracao + 0.45
+                continue
+
+            state["produto_selecionado"] = opcao_escolhida
+            state["catalogo_status"] = "produto_selecionado"
+            state["aguardando_selecao_catalogo"] = False
+            state["acao_proxima"] = "produto_selecionado"
+
+            resposta_selecao = (
+                "Certo. Você escolheu "
+                + frase_opcao_catalogo(opcao_escolhida)
+                + ". O resultado ficou registrado."
+            )
+            recorded_turns.append(
+                {
+                    "numero": turn_number,
+                    "cliente": transcript,
+                    "agente": resposta_selecao,
+                }
+            )
+            history.append(
+                {
+                    "role": "user",
+                    "content": transcript,
+                }
+            )
+            history.append(
+                {
+                    "role": "assistant",
+                    "content": resposta_selecao,
+                }
+            )
+            await speak_text(
+                writer,
+                resposta_selecao,
+                session_uuid,
+            )
+            complete = True
+            end_reason = "produto_selecionado"
+            result = "produto_selecionado"
+            break
+
         try:
             decision = await asyncio.to_thread(
                 generate_multiturn_decision,
@@ -1594,6 +2117,184 @@ async def handle_multiturn_session(
                 separators=(",", ":"),
             ),
         )
+
+        if (
+            decision.get("acao") == "buscar_produto"
+            and CONSULTA_CATALOGO_ATIVA
+        ):
+            state["catalogo_tentativas"] = (
+                int(state.get("catalogo_tentativas") or 0)
+                + 1
+            )
+            catalogo_tentativas = int(
+                state["catalogo_tentativas"]
+            )
+
+            resposta_espera = reply or (
+                "Certo. Vou consultar o catálogo agora."
+            )
+            await speak_text(
+                writer,
+                resposta_espera,
+                session_uuid,
+            )
+
+            try:
+                catalogo_payload = await asyncio.to_thread(
+                    consultar_catalogo_na_api,
+                    state,
+                )
+                catalogo_opcoes = obter_opcoes_catalogo(
+                    catalogo_payload
+                )
+                state["catalogo_status"] = (
+                    catalogo_payload.get("status")
+                    or "sem_status"
+                )
+                state["catalogo_opcoes"] = catalogo_opcoes
+                state["ultima_consulta_catalogo"] = (
+                    resumo_consulta_catalogo(
+                        catalogo_payload,
+                        catalogo_opcoes,
+                    )
+                )
+
+                logger.info(
+                    "CONSULTA CATALOGO: uuid=%s turno=%s "
+                    "status=%s quantidade=%s consulta_id=%s",
+                    session_uuid,
+                    turn_number,
+                    state["catalogo_status"],
+                    len(catalogo_opcoes),
+                    catalogo_payload.get("consulta_id"),
+                )
+
+            except Exception:
+                logger.exception(
+                    "Falha na consulta ao catálogo: uuid=%s "
+                    "turno=%s",
+                    session_uuid,
+                    turn_number,
+                )
+                resposta_catalogo = (
+                    "Não consegui consultar o catálogo agora. "
+                    "A solicitação ficou registrada para continuidade."
+                )
+                recorded_turns[-1]["agente"] = (
+                    f"{resposta_espera} {resposta_catalogo}"
+                )
+                history[-1]["content"] = (
+                    recorded_turns[-1]["agente"]
+                )
+                await speak_text(
+                    writer,
+                    resposta_catalogo,
+                    session_uuid,
+                )
+                state["catalogo_status"] = "erro"
+                state["acao_proxima"] = "atendimento_posterior"
+                complete = False
+                end_reason = "falha_consulta_catalogo"
+                result = "falha_consulta_catalogo"
+                break
+
+            if not catalogo_opcoes:
+                state["catalogo_status"] = "nao_encontrado"
+                state["acao_proxima"] = "perguntar_referencia"
+                complete = False
+
+                if (
+                    catalogo_tentativas
+                    < MAX_TENTATIVAS_CATALOGO
+                ):
+                    resposta_catalogo = (
+                        "Não encontrei uma opção com esses dados. "
+                        "Você tem o código ou a referência da peça?"
+                    )
+                    recorded_turns[-1]["agente"] = (
+                        f"{resposta_espera} {resposta_catalogo}"
+                    )
+                    history[-1]["content"] = (
+                        recorded_turns[-1]["agente"]
+                    )
+                    resposta_duracao = await speak_text(
+                        writer,
+                        resposta_catalogo,
+                        session_uuid,
+                    )
+                    await send_tone(writer)
+                    discard_seconds = resposta_duracao + 0.45
+                    continue
+
+                resposta_catalogo = (
+                    "Ainda não encontrei a peça no catálogo. "
+                    "A solicitação ficou registrada para atendimento."
+                )
+                recorded_turns[-1]["agente"] = (
+                    f"{resposta_espera} {resposta_catalogo}"
+                )
+                history[-1]["content"] = (
+                    recorded_turns[-1]["agente"]
+                )
+                await speak_text(
+                    writer,
+                    resposta_catalogo,
+                    session_uuid,
+                )
+                end_reason = "produto_nao_encontrado"
+                result = "produto_nao_encontrado"
+                break
+
+            if len(catalogo_opcoes) == 1:
+                opcao_unica = catalogo_opcoes[0]
+                state["produto_selecionado"] = opcao_unica
+                state["catalogo_status"] = "produto_encontrado"
+                state["acao_proxima"] = "produto_encontrado"
+                state["aguardando_selecao_catalogo"] = False
+
+                resposta_catalogo = (
+                    "Encontrei "
+                    + frase_opcao_catalogo(opcao_unica)
+                    + ". O resultado ficou registrado."
+                )
+                recorded_turns[-1]["agente"] = (
+                    f"{resposta_espera} {resposta_catalogo}"
+                )
+                history[-1]["content"] = (
+                    recorded_turns[-1]["agente"]
+                )
+                await speak_text(
+                    writer,
+                    resposta_catalogo,
+                    session_uuid,
+                )
+                complete = True
+                end_reason = "produto_encontrado"
+                result = "produto_encontrado"
+                break
+
+            state["catalogo_status"] = "multiplos_resultados"
+            state["aguardando_selecao_catalogo"] = True
+            state["acao_proxima"] = "selecionar_produto"
+            complete = False
+
+            resposta_catalogo = resposta_multiplas_opcoes(
+                catalogo_opcoes
+            )
+            recorded_turns[-1]["agente"] = (
+                f"{resposta_espera} {resposta_catalogo}"
+            )
+            history[-1]["content"] = (
+                recorded_turns[-1]["agente"]
+            )
+            resposta_duracao = await speak_text(
+                writer,
+                resposta_catalogo,
+                session_uuid,
+            )
+            await send_tone(writer)
+            discard_seconds = resposta_duracao + 0.45
+            continue
 
         reached_limit = (
             turn_number >= MAX_CONVERSATION_TURNS
@@ -1707,6 +2408,15 @@ async def handle_multiturn_session(
             "frames_audio": stats.frames_audio,
             "bytes_audio": stats.bytes_audio,
             "modo": "multiturn",
+            "catalogo_status": state.get(
+                "catalogo_status"
+            ),
+            "ultima_consulta_catalogo": state.get(
+                "ultima_consulta_catalogo"
+            ),
+            "produto_selecionado": state.get(
+                "produto_selecionado"
+            ),
         },
     }
 
@@ -2079,12 +2789,12 @@ async def main() -> None:
         for sock in server.sockets or []
     )
     logger.info(
-        "Gateway de voz RBK v0.5.2 iniciado: endereços=%s "
+        "Gateway de voz RBK v0.6.0 iniciado: endereços=%s "
         "echo_uuid=%s stt_uuid=%s conversation_uuid=%s "
         "multiturn_uuid=%s modelo_stt=%s modelo_llm=%s "
         "max_turnos=%s persistencia_ativa=%s "
         "cliente_persistencia=%s silencio_final=%.2fs "
-        "min_fala=%.2fs",
+        "min_fala=%.2fs catalogo_ativo=%s catalogo_limite=%s",
         addresses,
         ECHO_UUID,
         STT_UUID,
@@ -2097,6 +2807,8 @@ async def main() -> None:
         PERSISTENCIA_CLIENTE_ID or "não_configurado",
         SILENCE_SECONDS,
         MIN_SPEECH_SECONDS,
+        CONSULTA_CATALOGO_ATIVA,
+        CONSULTA_CATALOGO_LIMITE,
     )
 
     stop_event = asyncio.Event()
