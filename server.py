@@ -70,7 +70,7 @@ MULTITURN_UUID = os.getenv(
 ).strip()
 
 MAX_CONVERSATION_TURNS = int(
-    os.getenv("MAX_CONVERSATION_TURNS", "8")
+    os.getenv("MAX_CONVERSATION_TURNS", "24")
 )
 
 API_COMERCIAL_URL = os.getenv(
@@ -127,6 +127,34 @@ MAX_TENTATIVAS_CATALOGO = int(
     os.getenv("MAX_TENTATIVAS_CATALOGO", "2")
 )
 
+ORCAMENTO_IA_ATIVO = os.getenv(
+    "ORCAMENTO_IA_ATIVO",
+    "true",
+).strip().lower() in {"1", "true", "sim", "yes"}
+ENCARTE_OFERTAS_ATIVAS = os.getenv(
+    "ENCARTE_OFERTAS_ATIVAS",
+    "true",
+).strip().lower() in {"1", "true", "sim", "yes"}
+ENCARTE_QUANTIDADE_OFERTAS = max(
+    3,
+    min(
+        int(os.getenv("ENCARTE_QUANTIDADE_OFERTAS", "5")),
+        12,
+    ),
+)
+ENCARTE_MAX_RECUSAS_CONSECUTIVAS = max(
+    1,
+    min(
+        int(
+            os.getenv(
+                "ENCARTE_MAX_RECUSAS_CONSECUTIVAS",
+                "2",
+            )
+        ),
+        4,
+    ),
+)
+
 VAD_RMS_THRESHOLD = int(os.getenv("VAD_RMS_THRESHOLD", "350"))
 SILENCE_SECONDS = float(os.getenv("SILENCE_SECONDS", "0.70"))
 MIN_SPEECH_SECONDS = float(os.getenv("MIN_SPEECH_SECONDS", "0.45"))
@@ -157,7 +185,7 @@ GREETING_TEXT = (
 
 MULTITURN_GREETING_TEXT = (
     "Olá. Aqui é o Carlos da RBK Distribuidora. "
-    "Diga a peça que procura e a marca e o modelo da máquina. "
+    "Diga a peça, acessório ou EPI que você procura. "
     "Depois do sinal, pode falar."
 )
 
@@ -212,33 +240,27 @@ Retorne SOMENTE um objeto JSON válido com esta estrutura:
 
 Regras obrigatórias:
 - Fale em português do Brasil.
-- Seja direto, comercial e orientado a concluir ou preservar a venda.
+- Seja direto, comercial, persuasivo e não insistente.
+- O sistema controla quantidade, carrinho, encarte e confirmação.
+- Sua função neste JSON é identificar o produto solicitado e iniciar a busca.
+- Não encerre a conversa apenas porque um produto foi localizado.
 - Não faça diagnóstico mecânico.
 - Nunca pergunte defeito, problema, sintoma ou motivo da troca quando o
   cliente já informou o produto que quer comprar.
 - Não exija marca ou modelo para acessórios, EPIs, consumíveis ou produtos
   universais.
-- Preserve na descrição solicitada as características informadas pelo
-  cliente: material, cor, tipo, tamanho, aplicação, simples, duplo,
-  universal, pigmentada, malha, látex, raspa, vaqueta e outras.
-- Exemplos de consultas prontas sem máquina:
-  "cinto de sustentação para roçadeira universal laranja";
-  "luva de malha pigmentada branca";
-  "luva de raspa";
-  "óculos de proteção incolor".
-- Para peças ligadas a uma máquina, use marca e modelo quando forem
-  informados. Exemplo: "embreagem para MS 170".
+- Preserve na descrição solicitada material, cor, tipo, tamanho, aplicação,
+  simples, duplo, universal, pigmentada, malha, látex, raspa e vaqueta.
+- Para peças ligadas a uma máquina, use marca e modelo quando informados.
 - Códigos Stihl iniciados por MS identificam motosserras.
 - Códigos Stihl iniciados por FS identificam roçadeiras.
-- Assim que houver um produto ou uma descrição comercial utilizável, use
-  acao=buscar_produto. A consulta ao catálogo é preferível a perguntas
-  desnecessárias.
-- Só faça pergunta adicional quando não houver produto identificável ou
-  quando o resultado real do catálogo exigir diferenciação.
+- Assim que houver produto ou descrição comercial utilizável, use
+  acao=buscar_produto.
+- Só faça pergunta adicional quando não houver produto identificável.
 - Quantidade não é obrigatória para iniciar a busca.
 - Não invente preço, estoque, prazo, código, aplicação ou compatibilidade.
-- Preço e estoque vêm exclusivamente da API Comercial.
-- Se o cliente pedir para encerrar, use encerrar=true e acao=encerrar.
+- Se o cliente pedir para encerrar todo o atendimento, use
+  encerrar=true e acao=encerrar.
 - A resposta deve ter no máximo duas frases curtas e 220 caracteres.
 - Não use markdown, listas, emojis nem texto fora do JSON.
 """.strip()
@@ -261,6 +283,21 @@ INITIAL_SALES_STATE = {
     "catalogo_opcoes": [],
     "produto_selecionado": None,
     "ultima_consulta_catalogo": None,
+    "carrinho": [],
+    "orcamento_id": None,
+    "orcamento_status": None,
+    "aguardando_quantidade": False,
+    "item_pendente": None,
+    "aguardando_mais_produtos": False,
+    "aguardando_resposta_encarte": False,
+    "encarte_ofertas": [],
+    "encarte_indice": 0,
+    "encarte_produto_atual": None,
+    "encarte_skus_oferecidos": [],
+    "encarte_recusas_consecutivas": 0,
+    "encarte_concluido": False,
+    "aguardando_confirmacao_orcamento": False,
+    "chamada_externa_id": None,
     "dados_tecnicos": {},
     "observacoes": [],
 }
@@ -381,7 +418,7 @@ def transcribe_with_groq(pcm_audio: bytes) -> str:
             "Authorization": f"Bearer {GROQ_API_KEY}",
             "Accept": "application/json",
             "Content-Type": f"multipart/form-data; boundary={boundary}",
-            "User-Agent": "RBK-Vendedor-IA-Gateway/0.6.3",
+            "User-Agent": "RBK-Vendedor-IA-Gateway/0.7.0",
         },
     )
 
@@ -438,7 +475,7 @@ def generate_sales_reply(transcript: str) -> str:
             "Authorization": f"Bearer {GROQ_API_KEY}",
             "Accept": "application/json",
             "Content-Type": "application/json",
-            "User-Agent": "RBK-Vendedor-IA-Gateway/0.6.3",
+            "User-Agent": "RBK-Vendedor-IA-Gateway/0.7.0",
         },
     )
 
@@ -517,6 +554,51 @@ def merge_sales_state(
         ),
         "ultima_consulta_catalogo": current_state.get(
             "ultima_consulta_catalogo"
+        ),
+        "carrinho": list(
+            current_state.get("carrinho") or []
+        ),
+        "orcamento_id": current_state.get("orcamento_id"),
+        "orcamento_status": current_state.get(
+            "orcamento_status"
+        ),
+        "aguardando_quantidade": bool(
+            current_state.get("aguardando_quantidade")
+        ),
+        "item_pendente": current_state.get("item_pendente"),
+        "aguardando_mais_produtos": bool(
+            current_state.get("aguardando_mais_produtos")
+        ),
+        "aguardando_resposta_encarte": bool(
+            current_state.get("aguardando_resposta_encarte")
+        ),
+        "encarte_ofertas": list(
+            current_state.get("encarte_ofertas") or []
+        ),
+        "encarte_indice": int(
+            current_state.get("encarte_indice") or 0
+        ),
+        "encarte_produto_atual": current_state.get(
+            "encarte_produto_atual"
+        ),
+        "encarte_skus_oferecidos": list(
+            current_state.get("encarte_skus_oferecidos") or []
+        ),
+        "encarte_recusas_consecutivas": int(
+            current_state.get(
+                "encarte_recusas_consecutivas"
+            ) or 0
+        ),
+        "encarte_concluido": bool(
+            current_state.get("encarte_concluido")
+        ),
+        "aguardando_confirmacao_orcamento": bool(
+            current_state.get(
+                "aguardando_confirmacao_orcamento"
+            )
+        ),
+        "chamada_externa_id": current_state.get(
+            "chamada_externa_id"
         ),
         "atributos_busca": dict(
             current_state.get("atributos_busca") or {}
@@ -908,7 +990,7 @@ def generate_multiturn_decision(
             "Authorization": f"Bearer {GROQ_API_KEY}",
             "Accept": "application/json",
             "Content-Type": "application/json",
-            "User-Agent": "RBK-Vendedor-IA-Gateway/0.6.3",
+            "User-Agent": "RBK-Vendedor-IA-Gateway/0.7.0",
         },
     )
 
@@ -1082,7 +1164,7 @@ def consultar_catalogo_na_api(estado: dict) -> dict:
         headers={
             "X-API-Key": API_COMERCIAL_KEY,
             "Accept": "application/json",
-            "User-Agent": "RBK-Vendedor-IA-Gateway/0.6.3",
+            "User-Agent": "RBK-Vendedor-IA-Gateway/0.7.0",
         },
     )
 
@@ -1472,6 +1554,561 @@ def resumo_consulta_catalogo(
         ],
     }
 
+
+PALAVRAS_NUMERICAS = {
+    "um": 1,
+    "uma": 1,
+    "dois": 2,
+    "duas": 2,
+    "tres": 3,
+    "três": 3,
+    "quatro": 4,
+    "cinco": 5,
+    "seis": 6,
+    "sete": 7,
+    "oito": 8,
+    "nove": 9,
+    "dez": 10,
+    "onze": 11,
+    "doze": 12,
+    "treze": 13,
+    "quatorze": 14,
+    "catorze": 14,
+    "quinze": 15,
+    "dezesseis": 16,
+    "dezessete": 17,
+    "dezoito": 18,
+    "dezenove": 19,
+    "vinte": 20,
+    "trinta": 30,
+    "quarenta": 40,
+    "cinquenta": 50,
+    "sessenta": 60,
+    "setenta": 70,
+    "oitenta": 80,
+    "noventa": 90,
+    "cem": 100,
+}
+
+
+def texto_normalizado_simples(valor: object) -> str:
+    texto = str(valor or "").casefold()
+    texto = "".join(
+        caractere
+        for caractere in unicodedata.normalize("NFKD", texto)
+        if not unicodedata.combining(caractere)
+    )
+    return re.sub(r"\s+", " ", texto).strip()
+
+
+def extrair_quantidade_cliente(texto: str) -> float | None:
+    normalizado = texto_normalizado_simples(texto)
+
+    if "meia duzia" in normalizado:
+        return 6.0
+    if "uma duzia" in normalizado or normalizado == "duzia":
+        return 12.0
+
+    correspondencia = re.search(
+        r"(?<!\w)(\d+(?:[.,]\d+)?)(?!\w)",
+        normalizado,
+    )
+    if correspondencia:
+        try:
+            numero = float(
+                correspondencia.group(1).replace(",", ".")
+            )
+            return numero if numero > 0 else None
+        except ValueError:
+            return None
+
+    tokens = re.findall(r"[a-z]+", normalizado)
+    total = 0
+    encontrou = False
+
+    for token in tokens:
+        if token in PALAVRAS_NUMERICAS:
+            total += PALAVRAS_NUMERICAS[token]
+            encontrou = True
+
+    if encontrou and total > 0:
+        return float(total)
+
+    return None
+
+
+def cliente_responde_sim(texto: str) -> bool:
+    normalizado = texto_normalizado_simples(texto)
+    padroes = (
+        "sim",
+        "quero",
+        "pode incluir",
+        "inclui",
+        "adicione",
+        "adiciona",
+        "vou querer",
+        "pode colocar",
+        "coloca",
+        "aproveitar",
+    )
+    return any(
+        normalizado == padrao
+        or normalizado.startswith(padrao + " ")
+        or f" {padrao} " in f" {normalizado} "
+        for padrao in padroes
+    )
+
+
+def cliente_responde_nao(texto: str) -> bool:
+    normalizado = texto_normalizado_simples(texto)
+    padroes = (
+        "nao",
+        "não",
+        "dispenso",
+        "agora nao",
+        "nao quero",
+        "deixa",
+        "pode passar",
+    )
+    return any(
+        normalizado == texto_normalizado_simples(padrao)
+        or normalizado.startswith(
+            texto_normalizado_simples(padrao) + " "
+        )
+        for padrao in padroes
+    )
+
+
+def cliente_nao_quer_mais_produtos(texto: str) -> bool:
+    normalizado = texto_normalizado_simples(texto)
+    if normalizado in {
+        "nao",
+        "nao obrigado",
+        "so isso",
+        "somente isso",
+        "nada mais",
+        "finalizar",
+    }:
+        return True
+
+    return any(
+        padrao in normalizado
+        for padrao in (
+            "pode fechar",
+            "fecha o orcamento",
+            "nao preciso de mais nada",
+            "pode finalizar",
+        )
+    )
+
+
+def cliente_recusa_encarte_completo(texto: str) -> bool:
+    normalizado = texto_normalizado_simples(texto)
+    return any(
+        padrao in normalizado
+        for padrao in (
+            "nao quero encarte",
+            "sem promocao",
+            "sem ofertas",
+            "nao ofereca mais",
+            "pode parar as ofertas",
+        )
+    )
+
+
+def formatar_quantidade_para_voz(valor: float) -> str:
+    if float(valor).is_integer():
+        numero = int(valor)
+        return (
+            "uma unidade"
+            if numero == 1
+            else f"{numero} unidades"
+        )
+    return f"{valor:g} unidades"
+
+
+def preparar_nova_busca(estado: dict) -> dict:
+    novo = dict(estado)
+    for chave in (
+        "categoria_solicitacao",
+        "descricao_solicitada",
+        "produto",
+        "tipo_maquina",
+        "marca_maquina",
+        "modelo_maquina",
+        "quantidade",
+        "termo_busca",
+        "catalogo_status",
+        "produto_selecionado",
+        "ultima_consulta_catalogo",
+    ):
+        novo[chave] = None
+
+    novo["atributos_busca"] = {}
+    novo["dados_tecnicos"] = {}
+    novo["catalogo_tentativas"] = 0
+    novo["aguardando_selecao_catalogo"] = False
+    novo["catalogo_opcoes"] = []
+    novo["item_pendente"] = None
+    novo["aguardando_quantidade"] = False
+    novo["aguardando_mais_produtos"] = False
+    novo["aguardando_confirmacao_orcamento"] = False
+    novo["acao_proxima"] = "buscar_outro_produto"
+    return novo
+
+
+def normalizar_item_para_carrinho(
+    opcao: dict,
+    origem: str,
+) -> dict:
+    preco = (
+        numero_decimal(opcao.get("preco_oferta"))
+        or numero_decimal(opcao.get("preco_efetivo"))
+        or numero_decimal(opcao.get("preco_promocional"))
+        or numero_decimal(opcao.get("preco"))
+    )
+
+    return {
+        "id": opcao.get("id"),
+        "sku": clean_state_text(
+            opcao.get("sku"),
+            max_length=80,
+        ),
+        "descricao": clean_state_text(
+            opcao.get("descricao"),
+            max_length=240,
+        ),
+        "preco_efetivo": preco,
+        "origem": origem,
+        "disponibilidade": clean_state_text(
+            opcao.get("disponibilidade_comercial"),
+            max_length=40,
+        ) or (
+            "pronta_entrega"
+            if opcao.get("tem_estoque")
+            else "nao_informada"
+        ),
+    }
+
+
+def adicionar_item_carrinho_local(
+    estado: dict,
+    item: dict,
+    quantidade: float,
+) -> dict:
+    carrinho = list(estado.get("carrinho") or [])
+    sku = clean_state_text(item.get("sku"), max_length=80)
+    preco = numero_decimal(item.get("preco_efetivo"))
+
+    if not sku or preco is None or preco <= 0:
+        raise RuntimeError(
+            "O item não possui SKU ou preço válido."
+        )
+
+    encontrado = None
+    for existente in carrinho:
+        if clean_state_text(
+            existente.get("sku"),
+            max_length=80,
+        ) == sku:
+            encontrado = existente
+            break
+
+    if encontrado is None:
+        encontrado = {
+            **item,
+            "quantidade": 0.0,
+            "valor_total": 0.0,
+        }
+        carrinho.append(encontrado)
+
+    encontrado["quantidade"] = round(
+        float(encontrado.get("quantidade") or 0)
+        + quantidade,
+        3,
+    )
+    encontrado["preco_efetivo"] = preco
+    encontrado["valor_total"] = round(
+        encontrado["quantidade"] * preco,
+        2,
+    )
+
+    estado["carrinho"] = carrinho
+    return estado
+
+
+def totais_carrinho(estado: dict) -> dict:
+    carrinho = list(estado.get("carrinho") or [])
+    return {
+        "quantidade_linhas": len(carrinho),
+        "quantidade_unidades": round(
+            sum(
+                float(item.get("quantidade") or 0)
+                for item in carrinho
+            ),
+            3,
+        ),
+        "valor_total": round(
+            sum(
+                float(item.get("valor_total") or 0)
+                for item in carrinho
+            ),
+            2,
+        ),
+    }
+
+
+def resumo_carrinho_para_voz(estado: dict) -> str:
+    totais = totais_carrinho(estado)
+    linhas = totais["quantidade_linhas"]
+    if linhas <= 0:
+        return "O orçamento ainda não possui produtos."
+
+    produtos = (
+        "um produto"
+        if linhas == 1
+        else f"{linhas} produtos"
+    )
+    total = formatar_preco_para_voz(
+        totais["valor_total"]
+    )
+    return (
+        f"Seu orçamento tem {produtos}, no total de {total}. "
+        "Posso confirmar esses itens?"
+    )
+
+
+def requisicao_json_api_comercial(
+    caminho: str,
+    method: str = "GET",
+    payload: dict | None = None,
+    timeout: int = 30,
+) -> dict:
+    if not API_COMERCIAL_URL or not API_COMERCIAL_KEY:
+        raise RuntimeError(
+            "API Comercial não configurada no gateway."
+        )
+
+    body = (
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+        ).encode("utf-8")
+        if payload is not None
+        else None
+    )
+    headers = {
+        "X-API-Key": API_COMERCIAL_KEY,
+        "Accept": "application/json",
+        "User-Agent": "RBK-Vendedor-IA-Gateway/0.7.0",
+    }
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+
+    request = urllib.request.Request(
+        f"{API_COMERCIAL_URL}{caminho}",
+        data=body,
+        method=method,
+        headers=headers,
+    )
+
+    try:
+        with urllib.request.urlopen(
+            request,
+            timeout=timeout,
+        ) as response:
+            retorno = json.loads(
+                response.read().decode(
+                    "utf-8",
+                    errors="replace",
+                )
+            )
+    except urllib.error.HTTPError as error:
+        detalhe = error.read().decode(
+            "utf-8",
+            errors="replace",
+        )
+        raise RuntimeError(
+            f"API Comercial retornou HTTP {error.code}: "
+            f"{detalhe[:1200]}"
+        ) from error
+    except (
+        urllib.error.URLError,
+        TimeoutError,
+        json.JSONDecodeError,
+    ) as error:
+        raise RuntimeError(
+            f"Falha na API Comercial: {error}"
+        ) from error
+
+    if not isinstance(retorno, dict):
+        raise RuntimeError(
+            "Resposta inválida da API Comercial."
+        )
+    return retorno
+
+
+def persistir_item_orcamento_na_api(
+    chamada_externa_id: str,
+    item: dict,
+    quantidade: float,
+) -> dict | None:
+    if not ORCAMENTO_IA_ATIVO:
+        return None
+
+    if not PERSISTENCIA_CLIENTE_ID:
+        raise RuntimeError(
+            "PERSISTENCIA_CLIENTE_ID não configurado."
+        )
+
+    retorno = requisicao_json_api_comercial(
+        "/orcamentos-ia/rascunho/itens",
+        method="POST",
+        payload={
+            "chamada_externa_id": chamada_externa_id,
+            "cliente_id": PERSISTENCIA_CLIENTE_ID,
+            "vendedor_codigo": (
+                PERSISTENCIA_VENDEDOR_CODIGO
+            ),
+            "sku": item["sku"],
+            "quantidade": quantidade,
+            "origem": item.get("origem") or "catalogo",
+            "disponibilidade": (
+                item.get("disponibilidade")
+                or "nao_informada"
+            ),
+            "dados_adicionais": {
+                "descricao_gateway": item.get(
+                    "descricao"
+                ),
+            },
+        },
+    )
+    return retorno
+
+
+def finalizar_orcamento_na_api(
+    chamada_externa_id: str,
+    status: str = "confirmado",
+) -> dict | None:
+    if not ORCAMENTO_IA_ATIVO:
+        return None
+
+    return requisicao_json_api_comercial(
+        "/orcamentos-ia/rascunho/finalizar",
+        method="POST",
+        payload={
+            "chamada_externa_id": chamada_externa_id,
+            "status": status,
+        },
+    )
+
+
+def consultar_ofertas_encarte_na_api(
+    estado: dict,
+) -> list[dict]:
+    if not ENCARTE_OFERTAS_ATIVAS:
+        return []
+
+    excluidos = {
+        clean_state_text(
+            item.get("sku"),
+            max_length=80,
+        )
+        for item in list(estado.get("carrinho") or [])
+        if isinstance(item, dict)
+    }
+    excluidos.update(
+        clean_state_text(sku, max_length=80)
+        for sku in list(
+            estado.get("encarte_skus_oferecidos") or []
+        )
+    )
+    excluidos.discard(None)
+
+    parametros = {
+        "quantidade": ENCARTE_QUANTIDADE_OFERTAS,
+    }
+    if excluidos:
+        parametros["excluir_skus"] = ",".join(
+            sorted(excluidos)
+        )
+
+    retorno = requisicao_json_api_comercial(
+        "/encarte/ofertas?"
+        + urllib.parse.urlencode(parametros),
+        timeout=CONSULTA_CATALOGO_TIMEOUT,
+    )
+    itens = retorno.get("ofertas")
+    if not isinstance(itens, list):
+        return []
+
+    ofertas: list[dict] = []
+    for item in itens:
+        if not isinstance(item, dict):
+            continue
+
+        normalizada = normalizar_item_para_carrinho(
+            item,
+            "encarte",
+        )
+        if (
+            normalizada.get("sku")
+            and normalizada.get("descricao")
+            and numero_decimal(
+                normalizada.get("preco_efetivo")
+            )
+        ):
+            ofertas.append(normalizada)
+
+    return ofertas
+
+
+def proxima_oferta_encarte(
+    estado: dict,
+) -> tuple[dict | None, str | None]:
+    ofertas = list(estado.get("encarte_ofertas") or [])
+    indice = int(estado.get("encarte_indice") or 0)
+
+    while indice < len(ofertas):
+        oferta = ofertas[indice]
+        indice += 1
+        estado["encarte_indice"] = indice
+
+        sku = clean_state_text(
+            oferta.get("sku"),
+            max_length=80,
+        )
+        if not sku:
+            continue
+
+        oferecidos = list(
+            estado.get("encarte_skus_oferecidos") or []
+        )
+        if sku not in oferecidos:
+            oferecidos.append(sku)
+        estado["encarte_skus_oferecidos"] = oferecidos
+        estado["encarte_produto_atual"] = oferta
+        estado["aguardando_resposta_encarte"] = True
+
+        descricao = descricao_para_voz(
+            oferta.get("descricao")
+        )
+        preco = formatar_preco_para_voz(
+            oferta.get("preco_efetivo")
+        )
+        mensagem = (
+            f"Também temos {descricao} por {preco} no encarte. "
+            "Quer aproveitar o preço e incluir algumas unidades?"
+        )
+        return oferta, mensagem
+
+    estado["encarte_concluido"] = True
+    estado["aguardando_resposta_encarte"] = False
+    estado["encarte_produto_atual"] = None
+    return None, None
+
+
 def montar_resumo_deterministico(
     estado: dict,
     levantamento_completo: bool,
@@ -1523,6 +2160,24 @@ def montar_resumo_deterministico(
         )
         if tecnicos:
             partes.append(f"Dados técnicos: {tecnicos}")
+
+    carrinho = estado.get("carrinho")
+    if isinstance(carrinho, list) and carrinho:
+        totais = totais_carrinho(estado)
+        partes.append(
+            "Carrinho: "
+            f"{totais['quantidade_linhas']} linhas, "
+            f"{totais['quantidade_unidades']} unidades, "
+            f"valor total R$ {totais['valor_total']:.2f}"
+        )
+        for item in carrinho[:20]:
+            partes.append(
+                "Item: "
+                f"{item.get('sku')} - "
+                f"{item.get('descricao')} - "
+                f"quantidade {item.get('quantidade')} - "
+                f"valor unitário {item.get('preco_efetivo')}"
+            )
 
     partes.append(
         "Levantamento técnico completo"
@@ -1577,7 +2232,7 @@ def persistir_conversa_na_api(payload: dict) -> dict | None:
                 "X-API-Key": API_COMERCIAL_KEY,
                 "Accept": "application/json",
                 "Content-Type": "application/json",
-                "User-Agent": "RBK-Vendedor-IA-Gateway/0.6.3",
+                "User-Agent": "RBK-Vendedor-IA-Gateway/0.7.0",
             },
         )
 
@@ -2017,6 +2672,7 @@ async def handle_multiturn_session(
     result = "triagem_incompleta"
 
     call_external_id = str(uuid.uuid4())
+    state["chamada_externa_id"] = call_external_id
     started_at = datetime.now(timezone.utc)
     started_monotonic = time.perf_counter()
 
@@ -2143,6 +2799,445 @@ async def handle_multiturn_session(
             discard_seconds = retry_duration + 0.45
             continue
 
+        if state.get("aguardando_quantidade"):
+            quantidade = extrair_quantidade_cliente(
+                transcript
+            )
+            item_pendente = state.get("item_pendente")
+
+            if (
+                quantidade is None
+                or quantidade <= 0
+                or not isinstance(item_pendente, dict)
+            ):
+                resposta_quantidade = (
+                    "Não identifiquei a quantidade. "
+                    "Quantas unidades você precisa?"
+                )
+                recorded_turns.append(
+                    {
+                        "numero": turn_number,
+                        "cliente": transcript,
+                        "agente": resposta_quantidade,
+                    }
+                )
+                history.append(
+                    {"role": "user", "content": transcript}
+                )
+                history.append(
+                    {
+                        "role": "assistant",
+                        "content": resposta_quantidade,
+                    }
+                )
+                duracao = await speak_text(
+                    writer,
+                    resposta_quantidade,
+                    session_uuid,
+                )
+                await send_tone(writer)
+                discard_seconds = duracao + 0.45
+                continue
+
+            state = adicionar_item_carrinho_local(
+                state,
+                item_pendente,
+                quantidade,
+            )
+
+            try:
+                retorno_orcamento = await asyncio.to_thread(
+                    persistir_item_orcamento_na_api,
+                    call_external_id,
+                    item_pendente,
+                    quantidade,
+                )
+                orcamento = (
+                    retorno_orcamento.get("orcamento")
+                    if isinstance(retorno_orcamento, dict)
+                    else None
+                )
+                if isinstance(orcamento, dict):
+                    state["orcamento_id"] = orcamento.get(
+                        "id"
+                    )
+                    state["orcamento_status"] = (
+                        orcamento.get("status")
+                    )
+            except Exception:
+                logger.exception(
+                    "Falha ao persistir item do orçamento: "
+                    "uuid=%s sku=%s",
+                    session_uuid,
+                    item_pendente.get("sku"),
+                )
+
+            state["aguardando_quantidade"] = False
+            state["item_pendente"] = None
+            state["aguardando_mais_produtos"] = True
+            state["aguardando_confirmacao_orcamento"] = False
+            state["acao_proxima"] = "perguntar_outro_produto"
+            state["encarte_recusas_consecutivas"] = 0
+
+            resposta_adicionado = (
+                "Adicionei "
+                + formatar_quantidade_para_voz(quantidade)
+                + " de "
+                + descricao_para_voz(
+                    item_pendente.get("descricao")
+                )
+                + ". Qual outro produto você precisa?"
+            )
+            recorded_turns.append(
+                {
+                    "numero": turn_number,
+                    "cliente": transcript,
+                    "agente": resposta_adicionado,
+                }
+            )
+            history.append(
+                {"role": "user", "content": transcript}
+            )
+            history.append(
+                {
+                    "role": "assistant",
+                    "content": resposta_adicionado,
+                }
+            )
+            duracao = await speak_text(
+                writer,
+                resposta_adicionado,
+                session_uuid,
+            )
+            await send_tone(writer)
+            discard_seconds = duracao + 0.45
+            continue
+
+        if state.get("aguardando_resposta_encarte"):
+            oferta_atual = state.get(
+                "encarte_produto_atual"
+            )
+
+            if (
+                cliente_responde_sim(transcript)
+                and isinstance(oferta_atual, dict)
+            ):
+                state["item_pendente"] = oferta_atual
+                state["aguardando_quantidade"] = True
+                state["aguardando_resposta_encarte"] = False
+                state["acao_proxima"] = (
+                    "perguntar_quantidade_encarte"
+                )
+                resposta_encarte = (
+                    "Certo. Quantas unidades você quer incluir?"
+                )
+                recorded_turns.append(
+                    {
+                        "numero": turn_number,
+                        "cliente": transcript,
+                        "agente": resposta_encarte,
+                    }
+                )
+                history.append(
+                    {"role": "user", "content": transcript}
+                )
+                history.append(
+                    {
+                        "role": "assistant",
+                        "content": resposta_encarte,
+                    }
+                )
+                duracao = await speak_text(
+                    writer,
+                    resposta_encarte,
+                    session_uuid,
+                )
+                await send_tone(writer)
+                discard_seconds = duracao + 0.45
+                continue
+
+            if (
+                cliente_responde_nao(transcript)
+                or cliente_recusa_encarte_completo(
+                    transcript
+                )
+            ):
+                state["aguardando_resposta_encarte"] = False
+                state["encarte_produto_atual"] = None
+                state["encarte_recusas_consecutivas"] = (
+                    int(
+                        state.get(
+                            "encarte_recusas_consecutivas"
+                        ) or 0
+                    )
+                    + 1
+                )
+
+                parar_ofertas = (
+                    cliente_recusa_encarte_completo(
+                        transcript
+                    )
+                    or state[
+                        "encarte_recusas_consecutivas"
+                    ]
+                    >= ENCARTE_MAX_RECUSAS_CONSECUTIVAS
+                )
+
+                if not parar_ofertas:
+                    _, mensagem_oferta = (
+                        proxima_oferta_encarte(state)
+                    )
+                    if mensagem_oferta:
+                        recorded_turns.append(
+                            {
+                                "numero": turn_number,
+                                "cliente": transcript,
+                                "agente": mensagem_oferta,
+                            }
+                        )
+                        history.append(
+                            {
+                                "role": "user",
+                                "content": transcript,
+                            }
+                        )
+                        history.append(
+                            {
+                                "role": "assistant",
+                                "content": mensagem_oferta,
+                            }
+                        )
+                        duracao = await speak_text(
+                            writer,
+                            mensagem_oferta,
+                            session_uuid,
+                        )
+                        await send_tone(writer)
+                        discard_seconds = duracao + 0.45
+                        continue
+
+                state["encarte_concluido"] = True
+                state["aguardando_confirmacao_orcamento"] = True
+                resposta_confirmacao = (
+                    resumo_carrinho_para_voz(state)
+                )
+                recorded_turns.append(
+                    {
+                        "numero": turn_number,
+                        "cliente": transcript,
+                        "agente": resposta_confirmacao,
+                    }
+                )
+                history.append(
+                    {"role": "user", "content": transcript}
+                )
+                history.append(
+                    {
+                        "role": "assistant",
+                        "content": resposta_confirmacao,
+                    }
+                )
+                duracao = await speak_text(
+                    writer,
+                    resposta_confirmacao,
+                    session_uuid,
+                )
+                await send_tone(writer)
+                discard_seconds = duracao + 0.45
+                continue
+
+            # O cliente pode interromper a oferta e pedir outro produto.
+            state["aguardando_resposta_encarte"] = False
+            state["encarte_produto_atual"] = None
+            state = preparar_nova_busca(state)
+
+        if state.get("aguardando_confirmacao_orcamento"):
+            if cliente_responde_sim(transcript):
+                confirmacao_persistida = True
+                try:
+                    retorno_final = await asyncio.to_thread(
+                        finalizar_orcamento_na_api,
+                        call_external_id,
+                        "confirmado",
+                    )
+                    orcamento = (
+                        retorno_final.get("orcamento")
+                        if isinstance(retorno_final, dict)
+                        else None
+                    )
+                    if isinstance(orcamento, dict):
+                        state["orcamento_id"] = orcamento.get(
+                            "id"
+                        )
+                        state["orcamento_status"] = (
+                            orcamento.get("status")
+                        )
+                except Exception:
+                    confirmacao_persistida = False
+                    logger.exception(
+                        "Falha ao confirmar orçamento: uuid=%s",
+                        session_uuid,
+                    )
+
+                if confirmacao_persistida:
+                    resposta_final = (
+                        "Certo. Os itens foram confirmados para "
+                        "a geração do orçamento."
+                    )
+                    complete = True
+                    end_reason = "orcamento_confirmado"
+                    result = "orcamento_confirmado"
+                else:
+                    resposta_final = (
+                        "Registrei os itens, mas houve uma falha "
+                        "na finalização. Vou encaminhar para revisão."
+                    )
+                    complete = False
+                    end_reason = "revisao_integracao"
+                    result = "revisao_integracao"
+
+                recorded_turns.append(
+                    {
+                        "numero": turn_number,
+                        "cliente": transcript,
+                        "agente": resposta_final,
+                    }
+                )
+                history.append(
+                    {"role": "user", "content": transcript}
+                )
+                history.append(
+                    {
+                        "role": "assistant",
+                        "content": resposta_final,
+                    }
+                )
+                await speak_text(
+                    writer,
+                    resposta_final,
+                    session_uuid,
+                )
+                break
+
+            state["aguardando_confirmacao_orcamento"] = False
+            state["aguardando_mais_produtos"] = True
+            resposta_ajuste = (
+                "Certo. Qual outro produto você quer acrescentar?"
+            )
+            recorded_turns.append(
+                {
+                    "numero": turn_number,
+                    "cliente": transcript,
+                    "agente": resposta_ajuste,
+                }
+            )
+            history.append(
+                {"role": "user", "content": transcript}
+            )
+            history.append(
+                {
+                    "role": "assistant",
+                    "content": resposta_ajuste,
+                }
+            )
+            duracao = await speak_text(
+                writer,
+                resposta_ajuste,
+                session_uuid,
+            )
+            await send_tone(writer)
+            discard_seconds = duracao + 0.45
+            continue
+
+        if state.get("aguardando_mais_produtos"):
+            if cliente_nao_quer_mais_produtos(transcript):
+                state["aguardando_mais_produtos"] = False
+
+                if (
+                    ENCARTE_OFERTAS_ATIVAS
+                    and not state.get("encarte_concluido")
+                ):
+                    try:
+                        if not state.get("encarte_ofertas"):
+                            state["encarte_ofertas"] = (
+                                await asyncio.to_thread(
+                                    consultar_ofertas_encarte_na_api,
+                                    state,
+                                )
+                            )
+                            state["encarte_indice"] = 0
+
+                        _, mensagem_oferta = (
+                            proxima_oferta_encarte(state)
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Falha ao consultar encarte: uuid=%s",
+                            session_uuid,
+                        )
+                        mensagem_oferta = None
+                        state["encarte_concluido"] = True
+
+                    if mensagem_oferta:
+                        recorded_turns.append(
+                            {
+                                "numero": turn_number,
+                                "cliente": transcript,
+                                "agente": mensagem_oferta,
+                            }
+                        )
+                        history.append(
+                            {
+                                "role": "user",
+                                "content": transcript,
+                            }
+                        )
+                        history.append(
+                            {
+                                "role": "assistant",
+                                "content": mensagem_oferta,
+                            }
+                        )
+                        duracao = await speak_text(
+                            writer,
+                            mensagem_oferta,
+                            session_uuid,
+                        )
+                        await send_tone(writer)
+                        discard_seconds = duracao + 0.45
+                        continue
+
+                state["aguardando_confirmacao_orcamento"] = True
+                resposta_confirmacao = (
+                    resumo_carrinho_para_voz(state)
+                )
+                recorded_turns.append(
+                    {
+                        "numero": turn_number,
+                        "cliente": transcript,
+                        "agente": resposta_confirmacao,
+                    }
+                )
+                history.append(
+                    {"role": "user", "content": transcript}
+                )
+                history.append(
+                    {
+                        "role": "assistant",
+                        "content": resposta_confirmacao,
+                    }
+                )
+                duracao = await speak_text(
+                    writer,
+                    resposta_confirmacao,
+                    session_uuid,
+                )
+                await send_tone(writer)
+                discard_seconds = duracao + 0.45
+                continue
+
+            state = preparar_nova_busca(state)
+
         if state.get("aguardando_selecao_catalogo"):
             opcoes_selecao = list(
                 state.get("catalogo_opcoes") or []
@@ -2188,12 +3283,19 @@ async def handle_multiturn_session(
             state["produto_selecionado"] = opcao_escolhida
             state["catalogo_status"] = "produto_selecionado"
             state["aguardando_selecao_catalogo"] = False
-            state["acao_proxima"] = "produto_selecionado"
+            state["item_pendente"] = (
+                normalizar_item_para_carrinho(
+                    opcao_escolhida,
+                    "catalogo",
+                )
+            )
+            state["aguardando_quantidade"] = True
+            state["acao_proxima"] = "perguntar_quantidade"
 
             resposta_selecao = (
                 "Certo. Você escolheu "
                 + frase_opcao_catalogo(opcao_escolhida)
-                + ". O resultado ficou registrado."
+                + ". Quantas unidades você precisa?"
             )
             recorded_turns.append(
                 {
@@ -2214,15 +3316,14 @@ async def handle_multiturn_session(
                     "content": resposta_selecao,
                 }
             )
-            await speak_text(
+            duracao = await speak_text(
                 writer,
                 resposta_selecao,
                 session_uuid,
             )
-            complete = True
-            end_reason = "produto_selecionado"
-            result = "produto_selecionado"
-            break
+            await send_tone(writer)
+            discard_seconds = duracao + 0.45
+            continue
 
         try:
             decision = await asyncio.to_thread(
@@ -2483,13 +3584,20 @@ async def handle_multiturn_session(
                 opcao_unica = catalogo_opcoes[0]
                 state["produto_selecionado"] = opcao_unica
                 state["catalogo_status"] = "produto_encontrado"
-                state["acao_proxima"] = "produto_encontrado"
+                state["item_pendente"] = (
+                    normalizar_item_para_carrinho(
+                        opcao_unica,
+                        "catalogo",
+                    )
+                )
+                state["aguardando_quantidade"] = True
+                state["acao_proxima"] = "perguntar_quantidade"
                 state["aguardando_selecao_catalogo"] = False
 
                 resposta_catalogo = (
                     "Encontrei "
                     + frase_opcao_catalogo(opcao_unica)
-                    + ". O resultado ficou registrado."
+                    + ". Quantas unidades você precisa?"
                 )
                 recorded_turns[-1]["agente"] = (
                     f"{resposta_espera} {resposta_catalogo}"
@@ -2497,15 +3605,15 @@ async def handle_multiturn_session(
                 history[-1]["content"] = (
                     recorded_turns[-1]["agente"]
                 )
-                await speak_text(
+                duracao = await speak_text(
                     writer,
                     resposta_catalogo,
                     session_uuid,
                 )
-                complete = True
-                end_reason = "produto_encontrado"
-                result = "produto_encontrado"
-                break
+                await send_tone(writer)
+                discard_seconds = duracao + 0.45
+                complete = False
+                continue
 
             state["catalogo_status"] = "multiplos_resultados"
             state["aguardando_selecao_catalogo"] = True
@@ -2537,8 +3645,15 @@ async def handle_multiturn_session(
 
         if reached_limit:
             final_reply = (
-                "Registrei as informações disponíveis. "
-                "Este teste atingiu o limite de perguntas e será encerrado."
+                (
+                    "O carrinho ficou salvo como rascunho. "
+                    "A conversa atingiu o limite de turnos."
+                )
+                if state.get("carrinho")
+                else (
+                    "Registrei as informações disponíveis. "
+                    "A conversa atingiu o limite de turnos."
+                )
             )
             recorded_turns[-1]["agente"] = (
                 f"{reply} {final_reply}"
@@ -2625,7 +3740,11 @@ async def handle_multiturn_session(
         "duracao_segundos": duration_seconds,
         "resumo": summary,
         "sentimento": None,
-        "intencao": "consulta_peca",
+        "intencao": (
+            "orcamento"
+            if state.get("carrinho")
+            else "consulta_peca"
+        ),
         "resultado": result,
         "levantamento_completo": complete,
         "motivo_encerramento": end_reason,
@@ -2650,6 +3769,15 @@ async def handle_multiturn_session(
             ),
             "produto_selecionado": state.get(
                 "produto_selecionado"
+            ),
+            "carrinho": state.get("carrinho"),
+            "totais_carrinho": totais_carrinho(state),
+            "orcamento_id": state.get("orcamento_id"),
+            "orcamento_status": state.get(
+                "orcamento_status"
+            ),
+            "encarte_skus_oferecidos": state.get(
+                "encarte_skus_oferecidos"
             ),
         },
     }
@@ -3023,7 +4151,7 @@ async def main() -> None:
         for sock in server.sockets or []
     )
     logger.info(
-        "Gateway de voz RBK v0.6.3 iniciado: endereços=%s "
+        "Gateway de voz RBK v0.7.0 iniciado: endereços=%s "
         "echo_uuid=%s stt_uuid=%s conversation_uuid=%s "
         "multiturn_uuid=%s modelo_stt=%s modelo_llm=%s "
         "max_turnos=%s persistencia_ativa=%s "
