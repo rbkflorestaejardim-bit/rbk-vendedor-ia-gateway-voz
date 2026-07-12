@@ -283,6 +283,7 @@ INITIAL_SALES_STATE = {
     "catalogo_opcoes": [],
     "produto_selecionado": None,
     "ultima_consulta_catalogo": None,
+    "pendencias_catalogo": [],
     "carrinho": [],
     "orcamento_id": None,
     "orcamento_status": None,
@@ -418,7 +419,7 @@ def transcribe_with_groq(pcm_audio: bytes) -> str:
             "Authorization": f"Bearer {GROQ_API_KEY}",
             "Accept": "application/json",
             "Content-Type": f"multipart/form-data; boundary={boundary}",
-            "User-Agent": "RBK-Vendedor-IA-Gateway/0.7.0",
+            "User-Agent": "RBK-Vendedor-IA-Gateway/0.7.1",
         },
     )
 
@@ -475,7 +476,7 @@ def generate_sales_reply(transcript: str) -> str:
             "Authorization": f"Bearer {GROQ_API_KEY}",
             "Accept": "application/json",
             "Content-Type": "application/json",
-            "User-Agent": "RBK-Vendedor-IA-Gateway/0.7.0",
+            "User-Agent": "RBK-Vendedor-IA-Gateway/0.7.1",
         },
     )
 
@@ -554,6 +555,9 @@ def merge_sales_state(
         ),
         "ultima_consulta_catalogo": current_state.get(
             "ultima_consulta_catalogo"
+        ),
+        "pendencias_catalogo": list(
+            current_state.get("pendencias_catalogo") or []
         ),
         "carrinho": list(
             current_state.get("carrinho") or []
@@ -990,7 +994,7 @@ def generate_multiturn_decision(
             "Authorization": f"Bearer {GROQ_API_KEY}",
             "Accept": "application/json",
             "Content-Type": "application/json",
-            "User-Agent": "RBK-Vendedor-IA-Gateway/0.7.0",
+            "User-Agent": "RBK-Vendedor-IA-Gateway/0.7.1",
         },
     )
 
@@ -1164,7 +1168,7 @@ def consultar_catalogo_na_api(estado: dict) -> dict:
         headers={
             "X-API-Key": API_COMERCIAL_KEY,
             "Accept": "application/json",
-            "User-Agent": "RBK-Vendedor-IA-Gateway/0.7.0",
+            "User-Agent": "RBK-Vendedor-IA-Gateway/0.7.1",
         },
     )
 
@@ -1382,7 +1386,6 @@ def frase_opcao_catalogo(
             opcao.get("preco_efetivo")
         )
     )
-    partes.append(formatar_estoque_para_voz(opcao))
 
     return ", ".join(
         parte
@@ -1487,28 +1490,23 @@ def filtrar_opcoes_comercializaveis(
     comercializaveis: list[dict] = []
 
     for opcao in base_avaliada:
-        preco = numero_decimal(opcao.get("preco_efetivo"))
-        estoque = opcao.get("estoque")
-        if not isinstance(estoque, dict):
-            estoque = {}
-
-        disponivel = numero_decimal(
-            estoque.get("disponivel")
+        preco = (
+            numero_decimal(opcao.get("preco_efetivo"))
+            or numero_decimal(
+                opcao.get("preco_promocional")
+            )
+            or numero_decimal(opcao.get("preco"))
         )
 
         tem_preco = bool(
-            opcao.get("preco_disponivel")
-            and preco is not None
+            preco is not None
             and preco > 0
         )
-        tem_estoque = bool(
-            opcao.get("tem_estoque")
-            and disponivel is not None
-            and disponivel > 0
-        )
 
-        if tem_preco and tem_estoque:
-            comercializaveis.append(opcao)
+        if tem_preco:
+            opcao_comercial = dict(opcao)
+            opcao_comercial["preco_efetivo"] = preco
+            comercializaveis.append(opcao_comercial)
 
     return comercializaveis
 
@@ -1727,6 +1725,85 @@ def formatar_quantidade_para_voz(valor: float) -> str:
     return f"{valor:g} unidades"
 
 
+def registrar_pendencia_catalogo_local(
+    estado: dict,
+    tipo: str,
+    motivo: str,
+    opcoes: list[dict] | None = None,
+) -> dict:
+    novo = dict(estado)
+    pendencias = list(
+        novo.get("pendencias_catalogo") or []
+    )
+
+    termo = (
+        clean_state_text(
+            novo.get("termo_busca"),
+            max_length=300,
+        )
+        or clean_state_text(
+            novo.get("descricao_solicitada"),
+            max_length=300,
+        )
+        or clean_state_text(
+            novo.get("produto"),
+            max_length=300,
+        )
+        or "Produto solicitado pelo cliente"
+    )
+
+    pendencia = {
+        "tipo": clean_state_text(
+            tipo,
+            max_length=80,
+        ),
+        "termo_busca": termo,
+        "produto": clean_state_text(
+            novo.get("produto"),
+            max_length=180,
+        ),
+        "marca": clean_state_text(
+            novo.get("marca_maquina"),
+            max_length=100,
+        ),
+        "modelo": clean_state_text(
+            novo.get("modelo_maquina"),
+            max_length=100,
+        ),
+        "motivo": clean_state_text(
+            motivo,
+            max_length=500,
+        ),
+        "opcoes_catalogo": list(opcoes or [])[:10],
+    }
+
+    chave = (
+        pendencia["tipo"],
+        pendencia["termo_busca"].casefold(),
+    )
+    chaves_existentes = {
+        (
+            clean_state_text(
+                item.get("tipo"),
+                max_length=80,
+            ),
+            clean_state_text(
+                item.get("termo_busca"),
+                max_length=300,
+            ).casefold(),
+        )
+        for item in pendencias
+        if isinstance(item, dict)
+    }
+
+    if chave not in chaves_existentes:
+        pendencias.append(pendencia)
+
+    novo["pendencias_catalogo"] = pendencias
+    return novo
+
+
+
 def preparar_nova_busca(estado: dict) -> dict:
     novo = dict(estado)
     for chave in (
@@ -1900,7 +1977,7 @@ def requisicao_json_api_comercial(
     headers = {
         "X-API-Key": API_COMERCIAL_KEY,
         "Accept": "application/json",
-        "User-Agent": "RBK-Vendedor-IA-Gateway/0.7.0",
+        "User-Agent": "RBK-Vendedor-IA-Gateway/0.7.1",
     }
     if body is not None:
         headers["Content-Type"] = "application/json"
@@ -2232,7 +2309,7 @@ def persistir_conversa_na_api(payload: dict) -> dict | None:
                 "X-API-Key": API_COMERCIAL_KEY,
                 "Accept": "application/json",
                 "Content-Type": "application/json",
-                "User-Agent": "RBK-Vendedor-IA-Gateway/0.7.0",
+                "User-Agent": "RBK-Vendedor-IA-Gateway/0.7.1",
             },
         )
 
@@ -3459,7 +3536,7 @@ async def handle_multiturn_session(
 
                 logger.info(
                     "CONSULTA CATALOGO: uuid=%s turno=%s "
-                    "status=%s recebidas=%s comercializaveis=%s "
+                    "status=%s recebidas=%s com_preco=%s "
                     "descartadas=%s consulta_id=%s",
                     session_uuid,
                     turn_number,
@@ -3481,9 +3558,22 @@ async def handle_multiturn_session(
                     session_uuid,
                     turn_number,
                 )
+                state = registrar_pendencia_catalogo_local(
+                    state,
+                    "falha_consulta_catalogo",
+                    (
+                        "A consulta ao catálogo falhou durante "
+                        "o atendimento."
+                    ),
+                )
+                state = preparar_nova_busca(state)
+                state["aguardando_mais_produtos"] = True
+                state["acao_proxima"] = "perguntar_outro_produto"
+
                 resposta_catalogo = (
-                    "A consulta está temporariamente indisponível. "
-                    "Vou encaminhar o pedido para revisão e retorno."
+                    "Não consegui consultar esse produto agora. "
+                    "Deixei a solicitação para revisão. "
+                    "Qual outro produto você precisa?"
                 )
                 recorded_turns[-1]["agente"] = (
                     f"{resposta_espera} {resposta_catalogo}"
@@ -3491,33 +3581,38 @@ async def handle_multiturn_session(
                 history[-1]["content"] = (
                     recorded_turns[-1]["agente"]
                 )
-                await speak_text(
+                duracao = await speak_text(
                     writer,
                     resposta_catalogo,
                     session_uuid,
                 )
-                state["catalogo_status"] = "erro"
-                state["acao_proxima"] = "atendimento_posterior"
+                await send_tone(writer)
+                discard_seconds = duracao + 0.45
                 complete = False
-                end_reason = "revisao_integracao"
-                result = "revisao_integracao"
-                break
+                continue
 
             if not catalogo_opcoes:
                 complete = False
 
                 if catalogo_opcoes_recebidas:
-                    state["catalogo_status"] = (
-                        "sem_opcao_comercializavel"
+                    state["catalogo_status"] = "produto_sem_preco"
+                    state = registrar_pendencia_catalogo_local(
+                        state,
+                        "produto_sem_preco",
+                        (
+                            "Foram encontrados cadastros compatíveis, "
+                            "mas nenhum possui preço de venda válido."
+                        ),
+                        catalogo_opcoes_recebidas,
                     )
-                    state["acao_proxima"] = (
-                        "verificar_disponibilidade"
-                    )
+                    state = preparar_nova_busca(state)
+                    state["aguardando_mais_produtos"] = True
+                    state["acao_proxima"] = "perguntar_outro_produto"
+
                     resposta_catalogo = (
-                        "Encontrei produtos compatíveis, mas estão "
-                        "indisponíveis no momento. Vou solicitar a "
-                        "verificação de preço, estoque e previsão de "
-                        "reposição para retorno."
+                        "Encontrei o cadastro desse produto, mas ele "
+                        "está sem preço de venda. Deixei para revisão. "
+                        "Qual outro produto você precisa?"
                     )
                     recorded_turns[-1]["agente"] = (
                         f"{resposta_espera} {resposta_catalogo}"
@@ -3525,14 +3620,14 @@ async def handle_multiturn_session(
                     history[-1]["content"] = (
                         recorded_turns[-1]["agente"]
                     )
-                    await speak_text(
+                    duracao = await speak_text(
                         writer,
                         resposta_catalogo,
                         session_uuid,
                     )
-                    end_reason = "aguardando_disponibilidade"
-                    result = "aguardando_disponibilidade"
-                    break
+                    await send_tone(writer)
+                    discard_seconds = duracao + 0.45
+                    continue
 
                 state["catalogo_status"] = "nao_encontrado"
                 state["acao_proxima"] = "perguntar_referencia"
@@ -3560,10 +3655,21 @@ async def handle_multiturn_session(
                     discard_seconds = resposta_duracao + 0.45
                     continue
 
+                state = registrar_pendencia_catalogo_local(
+                    state,
+                    "produto_nao_encontrado",
+                    (
+                        "O produto não foi localizado após as "
+                        "tentativas de busca."
+                    ),
+                )
+                state = preparar_nova_busca(state)
+                state["aguardando_mais_produtos"] = True
+                state["acao_proxima"] = "perguntar_outro_produto"
+
                 resposta_catalogo = (
-                    "Não localizei o produto com essa descrição. "
-                    "Vou encaminhar a solicitação para revisão do "
-                    "catálogo e retorno comercial."
+                    "Não localizei esse produto. Deixei a solicitação "
+                    "para revisão. Qual outro produto você precisa?"
                 )
                 recorded_turns[-1]["agente"] = (
                     f"{resposta_espera} {resposta_catalogo}"
@@ -3571,14 +3677,14 @@ async def handle_multiturn_session(
                 history[-1]["content"] = (
                     recorded_turns[-1]["agente"]
                 )
-                await speak_text(
+                duracao = await speak_text(
                     writer,
                     resposta_catalogo,
                     session_uuid,
                 )
-                end_reason = "revisao_catalogo"
-                result = "revisao_catalogo"
-                break
+                await send_tone(writer)
+                discard_seconds = duracao + 0.45
+                continue
 
             if len(catalogo_opcoes) == 1:
                 opcao_unica = catalogo_opcoes[0]
@@ -4151,7 +4257,7 @@ async def main() -> None:
         for sock in server.sockets or []
     )
     logger.info(
-        "Gateway de voz RBK v0.7.0 iniciado: endereços=%s "
+        "Gateway de voz RBK v0.7.1 iniciado: endereços=%s "
         "echo_uuid=%s stt_uuid=%s conversation_uuid=%s "
         "multiturn_uuid=%s modelo_stt=%s modelo_llm=%s "
         "max_turnos=%s persistencia_ativa=%s "
