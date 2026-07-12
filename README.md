@@ -1,11 +1,15 @@
-# RBK Vendedor IA — Gateway de Voz v0.6.2
+# RBK Vendedor IA — Gateway de Voz v0.6.3
 
-Carlos pesquisa peças, acessórios, consumíveis e EPIs pela descrição completa,
-sem exigir marca e modelo quando isso não se aplica.
+O gateway passa a respeitar a melhor correspondência calculada pela API.
 
-Exemplos: cinto universal laranja, luva de malha pigmentada branca e
-embreagem para MS 170.
+Exemplo: ao pedir uma luva de malha pigmentada branca, um produto preto com
+estoque não substitui a opção branca indisponível.
 
-Quando produtos compatíveis estão sem preço ou estoque, Carlos promete
-verificação de disponibilidade e a API cria oportunidade e pendência para
-revisão humana ou pelo futuro agente gerente.
+Carlos oferece somente produtos que:
+
+1. pertencem ao melhor nível de correspondência do pedido;
+2. possuem preço válido;
+3. possuem estoque disponível.
+
+Se os melhores produtos estiverem indisponíveis, a chamada gera a pendência
+de venda futura já criada na Etapa 29.

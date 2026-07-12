@@ -381,7 +381,7 @@ def transcribe_with_groq(pcm_audio: bytes) -> str:
             "Authorization": f"Bearer {GROQ_API_KEY}",
             "Accept": "application/json",
             "Content-Type": f"multipart/form-data; boundary={boundary}",
-            "User-Agent": "RBK-Vendedor-IA-Gateway/0.6.2",
+            "User-Agent": "RBK-Vendedor-IA-Gateway/0.6.3",
         },
     )
 
@@ -438,7 +438,7 @@ def generate_sales_reply(transcript: str) -> str:
             "Authorization": f"Bearer {GROQ_API_KEY}",
             "Accept": "application/json",
             "Content-Type": "application/json",
-            "User-Agent": "RBK-Vendedor-IA-Gateway/0.6.2",
+            "User-Agent": "RBK-Vendedor-IA-Gateway/0.6.3",
         },
     )
 
@@ -908,7 +908,7 @@ def generate_multiturn_decision(
             "Authorization": f"Bearer {GROQ_API_KEY}",
             "Accept": "application/json",
             "Content-Type": "application/json",
-            "User-Agent": "RBK-Vendedor-IA-Gateway/0.6.2",
+            "User-Agent": "RBK-Vendedor-IA-Gateway/0.6.3",
         },
     )
 
@@ -1082,7 +1082,7 @@ def consultar_catalogo_na_api(estado: dict) -> dict:
         headers={
             "X-API-Key": API_COMERCIAL_KEY,
             "Accept": "application/json",
-            "User-Agent": "RBK-Vendedor-IA-Gateway/0.6.2",
+            "User-Agent": "RBK-Vendedor-IA-Gateway/0.6.3",
         },
     )
 
@@ -1141,6 +1141,10 @@ def normalizar_opcao_catalogo(
     if not isinstance(estoque, dict):
         estoque = {}
 
+    correspondencia = item.get("correspondencia")
+    if not isinstance(correspondencia, dict):
+        correspondencia = {}
+
     return {
         "indice": indice,
         "id": item.get("id"),
@@ -1149,6 +1153,10 @@ def normalizar_opcao_catalogo(
             max_length=80,
         ),
         "descricao": descricao,
+        "melhor_correspondencia": bool(
+            item.get("melhor_correspondencia", True)
+        ),
+        "correspondencia": correspondencia,
         "preco": item.get("preco"),
         "preco_promocional": item.get(
             "preco_promocional"
@@ -1387,9 +1395,16 @@ def identificar_selecao_catalogo(
 def filtrar_opcoes_comercializaveis(
     opcoes: list[dict],
 ) -> list[dict]:
+    melhores = [
+        opcao
+        for opcao in opcoes
+        if opcao.get("melhor_correspondencia", True)
+    ]
+    base_avaliada = melhores or opcoes
+
     comercializaveis: list[dict] = []
 
-    for opcao in opcoes:
+    for opcao in base_avaliada:
         preco = numero_decimal(opcao.get("preco_efetivo"))
         estoque = opcao.get("estoque")
         if not isinstance(estoque, dict):
@@ -1414,6 +1429,7 @@ def filtrar_opcoes_comercializaveis(
             comercializaveis.append(opcao)
 
     return comercializaveis
+
 
 def resumo_consulta_catalogo(
     payload: dict,
@@ -1561,7 +1577,7 @@ def persistir_conversa_na_api(payload: dict) -> dict | None:
                 "X-API-Key": API_COMERCIAL_KEY,
                 "Accept": "application/json",
                 "Content-Type": "application/json",
-                "User-Agent": "RBK-Vendedor-IA-Gateway/0.6.2",
+                "User-Agent": "RBK-Vendedor-IA-Gateway/0.6.3",
             },
         )
 
@@ -3007,7 +3023,7 @@ async def main() -> None:
         for sock in server.sockets or []
     )
     logger.info(
-        "Gateway de voz RBK v0.6.2 iniciado: endereços=%s "
+        "Gateway de voz RBK v0.6.3 iniciado: endereços=%s "
         "echo_uuid=%s stt_uuid=%s conversation_uuid=%s "
         "multiturn_uuid=%s modelo_stt=%s modelo_llm=%s "
         "max_turnos=%s persistencia_ativa=%s "
