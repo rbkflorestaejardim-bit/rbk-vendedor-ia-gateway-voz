@@ -28,9 +28,18 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 GROQ_STT_MODEL = os.getenv(
     "GROQ_STT_MODEL",
-    "whisper-large-v3-turbo",
+    "whisper-large-v3",
 ).strip()
 GROQ_STT_LANGUAGE = os.getenv("GROQ_STT_LANGUAGE", "pt").strip()
+GROQ_STT_PROMPT = os.getenv(
+    "GROQ_STT_PROMPT",
+    (
+        "Brazilian Portuguese technical parts sales for forest and garden "
+        "equipment. Terms and model names include: carburador, corrente, "
+        "motosserra, roçadeira, soprador, Stihl MS 170, MS 180, FS 160, "
+        "Husqvarna, Toyama, Kawashima, Tekna, Nagano. Preserve model codes."
+    ),
+).strip()
 GROQ_LLM_MODEL = os.getenv(
     "GROQ_LLM_MODEL",
     "llama-3.1-8b-instant",
@@ -100,8 +109,8 @@ PERSISTENCIA_NUMERO_DESTINO = os.getenv(
 ).strip()
 
 VAD_RMS_THRESHOLD = int(os.getenv("VAD_RMS_THRESHOLD", "350"))
-SILENCE_SECONDS = float(os.getenv("SILENCE_SECONDS", "1.2"))
-MIN_SPEECH_SECONDS = float(os.getenv("MIN_SPEECH_SECONDS", "0.6"))
+SILENCE_SECONDS = float(os.getenv("SILENCE_SECONDS", "0.70"))
+MIN_SPEECH_SECONDS = float(os.getenv("MIN_SPEECH_SECONDS", "0.45"))
 MAX_CAPTURE_SECONDS = float(os.getenv("MAX_CAPTURE_SECONDS", "12"))
 PRE_ROLL_SECONDS = float(os.getenv("PRE_ROLL_SECONDS", "0.3"))
 
@@ -166,6 +175,7 @@ Retorne SOMENTE um objeto JSON válido com esta estrutura:
   "estado": {
     "nome_cliente": null,
     "produto": null,
+    "tipo_maquina": null,
     "marca_maquina": null,
     "modelo_maquina": null,
     "quantidade": null,
@@ -180,6 +190,11 @@ Regras obrigatórias:
 - Faça somente uma pergunta por turno.
 - Não repita perguntas já respondidas.
 - Atualize e devolva o estado completo, preservando dados anteriores.
+- Interprete a estrutura "peça para modelo" corretamente. Exemplo: em
+  "carburador para MS 170", produto=carburador, tipo_maquina=motosserra,
+  marca_maquina=Stihl e modelo_maquina=MS 170.
+- Códigos Stihl iniciados por MS identificam motosserras; não trate "MS"
+  como nome de pessoa, unidade de medida ou texto sem significado.
 - Não invente preço, estoque, prazo, código, aplicação ou compatibilidade.
 - O ERP ainda não está conectado neste piloto.
 - Se o cliente pedir para encerrar, disser que não tem interesse ou se
@@ -203,6 +218,7 @@ Regras obrigatórias:
 INITIAL_SALES_STATE = {
     "nome_cliente": None,
     "produto": None,
+    "tipo_maquina": None,
     "marca_maquina": None,
     "modelo_maquina": None,
     "quantidade": None,
@@ -308,6 +324,8 @@ def transcribe_with_groq(pcm_audio: bytes) -> str:
         "response_format": "json",
         "temperature": "0",
     }
+    if GROQ_STT_PROMPT:
+        fields["prompt"] = GROQ_STT_PROMPT
     body, boundary = encode_multipart(
         fields=fields,
         file_field="file",
@@ -324,7 +342,7 @@ def transcribe_with_groq(pcm_audio: bytes) -> str:
             "Authorization": f"Bearer {GROQ_API_KEY}",
             "Accept": "application/json",
             "Content-Type": f"multipart/form-data; boundary={boundary}",
-            "User-Agent": "RBK-Vendedor-IA-Gateway/0.5.0",
+            "User-Agent": "RBK-Vendedor-IA-Gateway/0.5.1",
         },
     )
 
@@ -381,7 +399,7 @@ def generate_sales_reply(transcript: str) -> str:
             "Authorization": f"Bearer {GROQ_API_KEY}",
             "Accept": "application/json",
             "Content-Type": "application/json",
-            "User-Agent": "RBK-Vendedor-IA-Gateway/0.5.0",
+            "User-Agent": "RBK-Vendedor-IA-Gateway/0.5.1",
         },
     )
 
@@ -433,6 +451,7 @@ def merge_sales_state(
     merged = {
         "nome_cliente": current_state.get("nome_cliente"),
         "produto": current_state.get("produto"),
+        "tipo_maquina": current_state.get("tipo_maquina"),
         "marca_maquina": current_state.get("marca_maquina"),
         "modelo_maquina": current_state.get("modelo_maquina"),
         "quantidade": current_state.get("quantidade"),
@@ -448,6 +467,7 @@ def merge_sales_state(
     for key in (
         "nome_cliente",
         "produto",
+        "tipo_maquina",
         "marca_maquina",
         "modelo_maquina",
         "quantidade",
@@ -475,6 +495,96 @@ def merge_sales_state(
     return merged
 
 
+PRODUCT_KEYWORDS = (
+    "carburador",
+    "corrente",
+    "cilindro",
+    "pistão",
+    "pistao",
+    "vela",
+    "filtro de ar",
+    "filtro de combustível",
+    "filtro de combustivel",
+    "sabres",
+    "sabre",
+    "embreagem",
+    "mola de partida",
+    "cordão de partida",
+    "cordao de partida",
+    "bobina",
+    "magneto",
+    "virabrequim",
+)
+
+
+def canonical_product(transcript: str) -> str | None:
+    lowered = transcript.casefold()
+    for keyword in PRODUCT_KEYWORDS:
+        if keyword in lowered:
+            if keyword in {"pistao", "pistão"}:
+                return "pistão"
+            if keyword in {"filtro de combustivel", "filtro de combustível"}:
+                return "filtro de combustível"
+            if keyword in {"cordao de partida", "cordão de partida"}:
+                return "cordão de partida"
+            if keyword == "sabres":
+                return "sabre"
+            return keyword
+    return None
+
+
+def infer_domain_hints(transcript: str) -> dict:
+    """Extrai fatos seguros antes do LLM; não decide compatibilidade."""
+    hints: dict = {
+        "dados_tecnicos": {},
+        "observacoes": [],
+    }
+
+    product = canonical_product(transcript)
+    if product:
+        hints["produto"] = product
+
+    # Stihl MS 170 / MS170 / MS-170: família de motosserras Stihl.
+    ms_match = re.search(
+        r"\b(?:stihl\s+)?m\s*s[\s-]*(\d{2,4}[a-z]?)\b",
+        transcript,
+        flags=re.IGNORECASE,
+    )
+    if ms_match:
+        model_number = ms_match.group(1).upper()
+        hints.update(
+            {
+                "tipo_maquina": "motosserra",
+                "marca_maquina": "Stihl",
+                "modelo_maquina": f"MS {model_number}",
+            }
+        )
+        hints["observacoes"].append(
+            "Modelo Stihl identificado pelo prefixo MS."
+        )
+
+    # Stihl FS: família usual de roçadeiras. Apenas classifica o equipamento.
+    fs_match = re.search(
+        r"\b(?:stihl\s+)?f\s*s[\s-]*(\d{2,4}[a-z]?)\b",
+        transcript,
+        flags=re.IGNORECASE,
+    )
+    if fs_match:
+        model_number = fs_match.group(1).upper()
+        hints.update(
+            {
+                "tipo_maquina": "roçadeira",
+                "marca_maquina": "Stihl",
+                "modelo_maquina": f"FS {model_number}",
+            }
+        )
+        hints["observacoes"].append(
+            "Modelo Stihl identificado pelo prefixo FS."
+        )
+
+    return hints
+
+
 def generate_multiturn_decision(
     transcript: str,
     current_state: dict,
@@ -482,6 +592,8 @@ def generate_multiturn_decision(
 ) -> dict:
     if not GROQ_API_KEY:
         raise RuntimeError("GROQ_API_KEY não configurada.")
+
+    domain_hints = infer_domain_hints(transcript)
 
     messages: list[dict[str, str]] = [
         {
@@ -527,7 +639,7 @@ def generate_multiturn_decision(
             "Authorization": f"Bearer {GROQ_API_KEY}",
             "Accept": "application/json",
             "Content-Type": "application/json",
-            "User-Agent": "RBK-Vendedor-IA-Gateway/0.5.0",
+            "User-Agent": "RBK-Vendedor-IA-Gateway/0.5.1",
         },
     )
 
@@ -561,6 +673,10 @@ def generate_multiturn_decision(
         current_state,
         decision_data.get("estado"),
     )
+    updated_state = merge_sales_state(
+        updated_state,
+        domain_hints,
+    )
     complete = bool_value(
         decision_data.get("levantamento_completo")
     )
@@ -591,6 +707,7 @@ def montar_resumo_deterministico(
     campos = [
         ("Cliente", estado.get("nome_cliente")),
         ("Produto", estado.get("produto")),
+        ("Tipo de máquina", estado.get("tipo_maquina")),
         ("Marca", estado.get("marca_maquina")),
         ("Modelo", estado.get("modelo_maquina")),
         ("Quantidade", estado.get("quantidade")),
@@ -663,7 +780,7 @@ def persistir_conversa_na_api(payload: dict) -> dict | None:
                 "X-API-Key": API_COMERCIAL_KEY,
                 "Accept": "application/json",
                 "Content-Type": "application/json",
-                "User-Agent": "RBK-Vendedor-IA-Gateway/0.5.0",
+                "User-Agent": "RBK-Vendedor-IA-Gateway/0.5.1",
             },
         )
 
@@ -1791,11 +1908,12 @@ async def main() -> None:
         for sock in server.sockets or []
     )
     logger.info(
-        "Gateway de voz RBK v0.5.0 iniciado: endereços=%s "
+        "Gateway de voz RBK v0.5.1 iniciado: endereços=%s "
         "echo_uuid=%s stt_uuid=%s conversation_uuid=%s "
         "multiturn_uuid=%s modelo_stt=%s modelo_llm=%s "
         "max_turnos=%s persistencia_ativa=%s "
-        "cliente_persistencia=%s",
+        "cliente_persistencia=%s silencio_final=%.2fs "
+        "min_fala=%.2fs",
         addresses,
         ECHO_UUID,
         STT_UUID,
@@ -1806,6 +1924,8 @@ async def main() -> None:
         MAX_CONVERSATION_TURNS,
         PERSISTENCIA_VOZ_ATIVA,
         PERSISTENCIA_CLIENTE_ID or "não_configurado",
+        SILENCE_SECONDS,
+        MIN_SPEECH_SECONDS,
     )
 
     stop_event = asyncio.Event()

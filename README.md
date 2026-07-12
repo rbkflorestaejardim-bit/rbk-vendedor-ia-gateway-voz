@@ -1,34 +1,21 @@
-# RBK Vendedor IA — Gateway de Voz v0.5.0
+# RBK Vendedor IA — Gateway de Voz v0.5.1
 
-Esta versão preserva os ramais `602`, `603`, `604` e `605` e adiciona
-persistência da conversa multi-turno na API Comercial.
+Correção de latência e interpretação técnica.
 
-## Dados registrados
+## Alterações
 
-Ao encerrar uma chamada no ramal `605`, o gateway envia:
+- reduz o silêncio de fechamento do turno de 1,2 s para 0,70 s;
+- reduz a fala mínima válida para 0,45 s;
+- prioriza `whisper-large-v3` para maior precisão;
+- envia glossário técnico ao STT;
+- preserva códigos de modelos na transcrição;
+- adiciona classificação determinística de modelos Stihl `MS` e `FS`;
+- interpreta `carburador para MS 170` como:
+  - produto: carburador;
+  - tipo de máquina: motosserra;
+  - marca: Stihl;
+  - modelo: MS 170.
 
-- identificador único da chamada;
-- horários e duração;
-- cada fala do cliente;
-- cada resposta do Carlos;
-- resumo determinístico;
-- estado comercial final;
-- dados técnicos;
-- motivo de encerramento;
-- modelos STT, LLM e TTS utilizados.
+A classificação não confirma compatibilidade. Ela apenas estrutura corretamente o pedido antes das perguntas técnicas.
 
-## Variáveis novas
-
-```env
-API_COMERCIAL_URL=https://api-comercial.129-121-37-172.sslip.io
-API_COMERCIAL_KEY=...
-PERSISTENCIA_VOZ_ATIVA=true
-PERSISTENCIA_CLIENTE_ID=<UUID do cliente de teste>
-PERSISTENCIA_AGENDA_ID=
-PERSISTENCIA_VENDEDOR_CODIGO=CARLOS_RS
-PERSISTENCIA_DIRECAO=entrada
-PERSISTENCIA_NUMERO_ORIGEM=7001
-PERSISTENCIA_NUMERO_DESTINO=605
-```
-
-O ramal e o `extensions.conf` não mudam nesta etapa.
+A API Comercial 0.7.0 e o Asterisk não precisam ser alterados.
