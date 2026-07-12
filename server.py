@@ -15,6 +15,7 @@ import uuid
 import wave
 from collections import deque
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 from piper import PiperVoice
@@ -60,6 +61,43 @@ MULTITURN_UUID = os.getenv(
 MAX_CONVERSATION_TURNS = int(
     os.getenv("MAX_CONVERSATION_TURNS", "8")
 )
+
+API_COMERCIAL_URL = os.getenv(
+    "API_COMERCIAL_URL",
+    "",
+).strip().rstrip("/")
+API_COMERCIAL_KEY = os.getenv(
+    "API_COMERCIAL_KEY",
+    "",
+).strip()
+PERSISTENCIA_VOZ_ATIVA = os.getenv(
+    "PERSISTENCIA_VOZ_ATIVA",
+    "false",
+).strip().lower() in {"1", "true", "sim", "yes"}
+PERSISTENCIA_CLIENTE_ID = os.getenv(
+    "PERSISTENCIA_CLIENTE_ID",
+    "",
+).strip()
+PERSISTENCIA_AGENDA_ID = os.getenv(
+    "PERSISTENCIA_AGENDA_ID",
+    "",
+).strip()
+PERSISTENCIA_VENDEDOR_CODIGO = os.getenv(
+    "PERSISTENCIA_VENDEDOR_CODIGO",
+    "CARLOS_RS",
+).strip().upper()
+PERSISTENCIA_DIRECAO = os.getenv(
+    "PERSISTENCIA_DIRECAO",
+    "entrada",
+).strip().lower()
+PERSISTENCIA_NUMERO_ORIGEM = os.getenv(
+    "PERSISTENCIA_NUMERO_ORIGEM",
+    "7001",
+).strip()
+PERSISTENCIA_NUMERO_DESTINO = os.getenv(
+    "PERSISTENCIA_NUMERO_DESTINO",
+    "605",
+).strip()
 
 VAD_RMS_THRESHOLD = int(os.getenv("VAD_RMS_THRESHOLD", "350"))
 SILENCE_SECONDS = float(os.getenv("SILENCE_SECONDS", "1.2"))
@@ -286,7 +324,7 @@ def transcribe_with_groq(pcm_audio: bytes) -> str:
             "Authorization": f"Bearer {GROQ_API_KEY}",
             "Accept": "application/json",
             "Content-Type": f"multipart/form-data; boundary={boundary}",
-            "User-Agent": "RBK-Vendedor-IA-Gateway/0.4.0",
+            "User-Agent": "RBK-Vendedor-IA-Gateway/0.5.0",
         },
     )
 
@@ -343,7 +381,7 @@ def generate_sales_reply(transcript: str) -> str:
             "Authorization": f"Bearer {GROQ_API_KEY}",
             "Accept": "application/json",
             "Content-Type": "application/json",
-            "User-Agent": "RBK-Vendedor-IA-Gateway/0.4.0",
+            "User-Agent": "RBK-Vendedor-IA-Gateway/0.5.0",
         },
     )
 
@@ -489,7 +527,7 @@ def generate_multiturn_decision(
             "Authorization": f"Bearer {GROQ_API_KEY}",
             "Accept": "application/json",
             "Content-Type": "application/json",
-            "User-Agent": "RBK-Vendedor-IA-Gateway/0.4.0",
+            "User-Agent": "RBK-Vendedor-IA-Gateway/0.5.0",
         },
     )
 
@@ -541,6 +579,152 @@ def generate_multiturn_decision(
         ) or "",
         "estado": updated_state,
     }
+
+
+def montar_resumo_deterministico(
+    estado: dict,
+    levantamento_completo: bool,
+    resultado: str,
+) -> str:
+    partes: list[str] = []
+
+    campos = [
+        ("Cliente", estado.get("nome_cliente")),
+        ("Produto", estado.get("produto")),
+        ("Marca", estado.get("marca_maquina")),
+        ("Modelo", estado.get("modelo_maquina")),
+        ("Quantidade", estado.get("quantidade")),
+    ]
+
+    for rotulo, valor in campos:
+        if valor not in (None, "", [], {}):
+            partes.append(f"{rotulo}: {valor}")
+
+    dados_tecnicos = estado.get("dados_tecnicos")
+    if isinstance(dados_tecnicos, dict) and dados_tecnicos:
+        tecnicos = ", ".join(
+            f"{chave}: {valor}"
+            for chave, valor in dados_tecnicos.items()
+            if valor not in (None, "", [], {})
+        )
+        if tecnicos:
+            partes.append(f"Dados técnicos: {tecnicos}")
+
+    partes.append(
+        "Levantamento técnico completo"
+        if levantamento_completo
+        else "Levantamento técnico incompleto"
+    )
+    partes.append(f"Resultado: {resultado}")
+
+    return "; ".join(partes)[:4000]
+
+
+def persistir_conversa_na_api(payload: dict) -> dict | None:
+    if not PERSISTENCIA_VOZ_ATIVA:
+        logger.info(
+            "Persistência de voz desativada: chamada_externa_id=%s",
+            payload.get("chamada_externa_id"),
+        )
+        return None
+
+    ausentes = [
+        nome
+        for nome, valor in {
+            "API_COMERCIAL_URL": API_COMERCIAL_URL,
+            "API_COMERCIAL_KEY": API_COMERCIAL_KEY,
+            "PERSISTENCIA_CLIENTE_ID": PERSISTENCIA_CLIENTE_ID,
+        }.items()
+        if not valor
+    ]
+    if ausentes:
+        raise RuntimeError(
+            "Persistência ativa com configuração incompleta: "
+            + ", ".join(ausentes)
+        )
+
+    url = (
+        f"{API_COMERCIAL_URL}/chamadas/"
+        "registrar-conversa-voz"
+    )
+    body = json.dumps(
+        payload,
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+    last_error: Exception | None = None
+
+    for attempt in range(1, 4):
+        request = urllib.request.Request(
+            url,
+            data=body,
+            method="POST",
+            headers={
+                "X-API-Key": API_COMERCIAL_KEY,
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "User-Agent": "RBK-Vendedor-IA-Gateway/0.5.0",
+            },
+        )
+
+        try:
+            with urllib.request.urlopen(
+                request,
+                timeout=30,
+            ) as response:
+                response_body = response.read().decode(
+                    "utf-8",
+                    errors="replace",
+                )
+                result = json.loads(response_body)
+
+                logger.info(
+                    "PERSISTENCIA API: chamada_externa_id=%s "
+                    "http=%s criada=%s idempotente=%s chamada_id=%s "
+                    "interacoes=%s",
+                    payload.get("chamada_externa_id"),
+                    response.status,
+                    result.get("criada"),
+                    result.get("idempotente"),
+                    (
+                        result.get("chamada") or {}
+                    ).get("id"),
+                    result.get("interacoes_registradas"),
+                )
+                return result
+
+        except urllib.error.HTTPError as error:
+            error_body = error.read().decode(
+                "utf-8",
+                errors="replace",
+            )
+            last_error = RuntimeError(
+                f"API Comercial retornou HTTP {error.code}: "
+                f"{error_body}"
+            )
+            if error.code < 500 or attempt >= 3:
+                raise last_error from error
+
+        except (
+            urllib.error.URLError,
+            TimeoutError,
+            json.JSONDecodeError,
+        ) as error:
+            last_error = error
+            if attempt >= 3:
+                raise RuntimeError(
+                    "Não foi possível persistir a conversa na "
+                    "API Comercial."
+                ) from error
+
+        time.sleep(attempt)
+
+    if last_error is not None:
+        raise RuntimeError(
+            "Falha desconhecida ao persistir conversa."
+        ) from last_error
+
+    return None
 
 
 def synthesize_piper_pcm8k(text: str) -> bytes:
@@ -909,7 +1093,23 @@ async def handle_multiturn_session(
 ) -> None:
     state = json.loads(json.dumps(INITIAL_SALES_STATE))
     history: list[dict[str, str]] = []
+    recorded_turns: list[dict[str, object]] = []
     no_speech_attempts = 0
+    complete = False
+    end_reason = "triagem_incompleta"
+    result = "triagem_incompleta"
+
+    call_external_id = str(uuid.uuid4())
+    started_at = datetime.now(timezone.utc)
+    started_monotonic = time.perf_counter()
+
+    logger.info(
+        "Conversa persistível iniciada: uuid=%s "
+        "chamada_externa_id=%s cliente_id=%s",
+        session_uuid,
+        call_external_id,
+        PERSISTENCIA_CLIENTE_ID or "não_configurado",
+    )
 
     greeting_duration = await speak_text(
         writer,
@@ -936,12 +1136,21 @@ async def handle_multiturn_session(
         discard_seconds = 0.0
 
         if capture.disconnected:
+            end_reason = capture.reason
+            result = (
+                "cliente_desligou"
+                if capture.reason in {
+                    "hangup",
+                    "conexao_encerrada",
+                }
+                else "falha_canal"
+            )
             logger.info(
                 "Conversa encerrada pelo canal: uuid=%s motivo=%s",
                 session_uuid,
                 capture.reason,
             )
-            return
+            break
 
         if not capture.audio:
             no_speech_attempts += 1
@@ -964,7 +1173,9 @@ async def handle_multiturn_session(
                     ),
                     session_uuid,
                 )
-                return
+                end_reason = "sem_fala"
+                result = "sem_fala"
+                break
 
             retry_duration = await speak_text(
                 writer,
@@ -1036,10 +1247,31 @@ async def handle_multiturn_session(
                 ),
                 session_uuid,
             )
-            return
+            recorded_turns.append(
+                {
+                    "numero": turn_number,
+                    "cliente": transcript,
+                    "agente": (
+                        "Tive uma falha ao processar sua resposta. "
+                        "Vou encerrar este teste agora."
+                    ),
+                }
+            )
+            end_reason = "falha_processamento"
+            result = "falha_processamento"
+            break
 
         state = decision["estado"]
         reply = decision["resposta"]
+        complete = decision["levantamento_completo"]
+
+        recorded_turns.append(
+            {
+                "numero": turn_number,
+                "cliente": transcript,
+                "agente": reply,
+            }
+        )
 
         history.append(
             {
@@ -1060,7 +1292,7 @@ async def handle_multiturn_session(
             session_uuid,
             turn_number,
             decision["encerrar"],
-            decision["levantamento_completo"],
+            complete,
             decision["motivo_encerramento"],
             reply,
         )
@@ -1085,11 +1317,16 @@ async def handle_multiturn_session(
                 "Registrei as informações disponíveis. "
                 "Este teste atingiu o limite de perguntas e será encerrado."
             )
+            recorded_turns[-1]["agente"] = (
+                f"{reply} {final_reply}"
+            )
             await speak_text(
                 writer,
                 final_reply,
                 session_uuid,
             )
+            end_reason = "limite_turnos"
+            result = "limite_turnos"
             break
 
         reply_duration = await speak_text(
@@ -1099,20 +1336,109 @@ async def handle_multiturn_session(
         )
 
         if decision["encerrar"]:
+            end_reason = (
+                decision["motivo_encerramento"]
+                or (
+                    "levantamento_completo"
+                    if complete
+                    else "encerrado_pelo_cliente"
+                )
+            )
+            result = (
+                "triagem_completa"
+                if complete
+                else "cliente_encerrou"
+            )
             break
 
         await send_tone(writer)
         discard_seconds = reply_duration + 0.45
 
+    finished_at = datetime.now(timezone.utc)
+    duration_seconds = max(
+        0,
+        int(round(time.perf_counter() - started_monotonic)),
+    )
+
+    if complete and result == "triagem_incompleta":
+        result = "triagem_completa"
+        end_reason = "levantamento_completo"
+
+    summary = montar_resumo_deterministico(
+        state,
+        complete,
+        result,
+    )
+
     logger.info(
-        "CONVERSA FINAL: uuid=%s estado=%s",
+        "CONVERSA FINAL: uuid=%s chamada_externa_id=%s "
+        "resultado=%s completo=%s motivo=%s estado=%s",
         session_uuid,
+        call_external_id,
+        result,
+        complete,
+        end_reason,
         json.dumps(
             state,
             ensure_ascii=False,
             separators=(",", ":"),
         ),
     )
+
+    persistence_payload = {
+        "cliente_id": PERSISTENCIA_CLIENTE_ID,
+        "vendedor_codigo": PERSISTENCIA_VENDEDOR_CODIGO,
+        "provedor": "asterisk_audiosocket",
+        "chamada_externa_id": call_external_id,
+        "numero_origem": PERSISTENCIA_NUMERO_ORIGEM or None,
+        "numero_destino": PERSISTENCIA_NUMERO_DESTINO or None,
+        "direcao": (
+            PERSISTENCIA_DIRECAO
+            if PERSISTENCIA_DIRECAO in {"entrada", "saida"}
+            else "entrada"
+        ),
+        "inicio_em": started_at.isoformat(),
+        "fim_em": finished_at.isoformat(),
+        "duracao_segundos": duration_seconds,
+        "resumo": summary,
+        "sentimento": None,
+        "intencao": "consulta_peca",
+        "resultado": result,
+        "levantamento_completo": complete,
+        "motivo_encerramento": end_reason,
+        "estado_comercial": state,
+        "turnos": recorded_turns,
+        "modelos": {
+            "stt": GROQ_STT_MODEL,
+            "llm": GROQ_LLM_MODEL,
+            "tts": Path(PIPER_VOICE_MODEL).name,
+        },
+        "dados_extraidos": {
+            "audiosocket_uuid": session_uuid,
+            "max_rms": stats.max_rms,
+            "frames_audio": stats.frames_audio,
+            "bytes_audio": stats.bytes_audio,
+            "modo": "multiturn",
+        },
+    }
+
+    if PERSISTENCIA_AGENDA_ID:
+        persistence_payload["agenda_id"] = (
+            PERSISTENCIA_AGENDA_ID
+        )
+
+    try:
+        await asyncio.to_thread(
+            persistir_conversa_na_api,
+            persistence_payload,
+        )
+    except Exception:
+        logger.exception(
+            "FALHA PERSISTENCIA API: uuid=%s "
+            "chamada_externa_id=%s",
+            session_uuid,
+            call_external_id,
+        )
 
 
 async def handle_client(
@@ -1465,10 +1791,11 @@ async def main() -> None:
         for sock in server.sockets or []
     )
     logger.info(
-        "Gateway de voz RBK v0.4.0 iniciado: endereços=%s "
+        "Gateway de voz RBK v0.5.0 iniciado: endereços=%s "
         "echo_uuid=%s stt_uuid=%s conversation_uuid=%s "
         "multiturn_uuid=%s modelo_stt=%s modelo_llm=%s "
-        "max_turnos=%s",
+        "max_turnos=%s persistencia_ativa=%s "
+        "cliente_persistencia=%s",
         addresses,
         ECHO_UUID,
         STT_UUID,
@@ -1477,6 +1804,8 @@ async def main() -> None:
         GROQ_STT_MODEL,
         GROQ_LLM_MODEL,
         MAX_CONVERSATION_TURNS,
+        PERSISTENCIA_VOZ_ATIVA,
+        PERSISTENCIA_CLIENTE_ID or "não_configurado",
     )
 
     stop_event = asyncio.Event()
