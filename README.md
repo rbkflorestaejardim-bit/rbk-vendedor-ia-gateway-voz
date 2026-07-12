@@ -1,12 +1,11 @@
-# RBK Vendedor IA — Gateway de Voz v0.6.1
+# RBK Vendedor IA — Gateway de Voz v0.6.2
 
-Carlos só oferece ao cliente produtos com preço válido e estoque disponível.
+Carlos pesquisa peças, acessórios, consumíveis e EPIs pela descrição completa,
+sem exigir marca e modelo quando isso não se aplica.
 
-Produtos compatíveis sem preço ou sem estoque permanecem registrados
-internamente, mas não são apresentados como opção de compra.
+Exemplos: cinto universal laranja, luva de malha pigmentada branca e
+embreagem para MS 170.
 
-Exemplo: se o SKU 12933 tem preço e estoque e o SKU 2452 não tem nenhum dos
-dois, Carlos informa somente o SKU 12933.
-
-Se nenhum produto compatível tiver preço e estoque, Carlos informa que não há
-opção disponível e registra a solicitação para atendimento posterior.
+Quando produtos compatíveis estão sem preço ou estoque, Carlos promete
+verificação de disponibilidade e a API cria oportunidade e pendência para
+revisão humana ou pelo futuro agente gerente.

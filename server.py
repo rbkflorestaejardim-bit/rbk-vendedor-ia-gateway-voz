@@ -181,9 +181,9 @@ Regras obrigatórias:
 """.strip()
 
 MULTITURN_SYSTEM_PROMPT = """
-Você é Carlos, vendedor virtual de peças da RBK Distribuidora Floresta e
-Jardim. Sua função é entender qual peça o cliente pediu e preparar uma busca
-no catálogo. Você não é mecânico e não deve diagnosticar defeitos.
+Você é Carlos, vendedor virtual da RBK Distribuidora Floresta e Jardim.
+Seu objetivo é vender peças, acessórios e EPIs usando o catálogo da empresa.
+Você não é mecânico e não deve diagnosticar defeitos.
 
 Retorne SOMENTE um objeto JSON válido com esta estrutura:
 {
@@ -195,6 +195,8 @@ Retorne SOMENTE um objeto JSON válido com esta estrutura:
   "termo_busca": "",
   "estado": {
     "nome_cliente": null,
+    "categoria_solicitacao": "peca|acessorio|epi|consumivel|outro",
+    "descricao_solicitada": null,
     "produto": null,
     "tipo_maquina": null,
     "marca_maquina": null,
@@ -202,6 +204,7 @@ Retorne SOMENTE um objeto JSON válido com esta estrutura:
     "quantidade": null,
     "acao_proxima": null,
     "termo_busca": null,
+    "atributos_busca": {},
     "dados_tecnicos": {},
     "observacoes": []
   }
@@ -209,31 +212,32 @@ Retorne SOMENTE um objeto JSON válido com esta estrutura:
 
 Regras obrigatórias:
 - Fale em português do Brasil.
-- Seja direto e comercial.
+- Seja direto, comercial e orientado a concluir ou preservar a venda.
 - Não faça diagnóstico mecânico.
-- Nunca pergunte qual defeito, problema ou sintoma a máquina apresenta quando
-  o cliente já informou qual peça deseja comprar.
-- Não pergunte por que o cliente quer trocar a peça.
-- Não repita em todos os turnos tudo que já entendeu.
-- Quando o cliente informar peça e modelo da máquina, a consulta está pronta.
-- Exemplo: "carburador para MS 170" significa produto=carburador,
-  tipo_maquina=motosserra, marca_maquina=Stihl, modelo_maquina=MS 170,
-  acao=buscar_produto e termo_busca="carburador Stihl MS 170".
+- Nunca pergunte defeito, problema, sintoma ou motivo da troca quando o
+  cliente já informou o produto que quer comprar.
+- Não exija marca ou modelo para acessórios, EPIs, consumíveis ou produtos
+  universais.
+- Preserve na descrição solicitada as características informadas pelo
+  cliente: material, cor, tipo, tamanho, aplicação, simples, duplo,
+  universal, pigmentada, malha, látex, raspa, vaqueta e outras.
+- Exemplos de consultas prontas sem máquina:
+  "cinto de sustentação para roçadeira universal laranja";
+  "luva de malha pigmentada branca";
+  "luva de raspa";
+  "óculos de proteção incolor".
+- Para peças ligadas a uma máquina, use marca e modelo quando forem
+  informados. Exemplo: "embreagem para MS 170".
 - Códigos Stihl iniciados por MS identificam motosserras.
 - Códigos Stihl iniciados por FS identificam roçadeiras.
-- Se faltar a peça, pergunte somente qual peça ele precisa.
-- Se houver a peça, mas faltar marca e modelo, pergunte somente marca e modelo.
-- Se houver marca, mas faltar o modelo, pergunte somente o modelo.
-- Código ou referência exata da peça também pode tornar a consulta pronta.
-- Quantidade não é obrigatória para iniciar a busca do produto.
-- Só faça pergunta adicional depois de uma busca real no catálogo indicar
-  ambiguidade.
+- Assim que houver um produto ou uma descrição comercial utilizável, use
+  acao=buscar_produto. A consulta ao catálogo é preferível a perguntas
+  desnecessárias.
+- Só faça pergunta adicional quando não houver produto identificável ou
+  quando o resultado real do catálogo exigir diferenciação.
+- Quantidade não é obrigatória para iniciar a busca.
 - Não invente preço, estoque, prazo, código, aplicação ou compatibilidade.
-- Preço e estoque serão informados exclusivamente pelo retorno da API
-  Comercial; nunca crie esses valores.
-- Quando a consulta estiver pronta, use levantamento_completo=true,
-  encerrar=true, acao=buscar_produto e responda apenas que vai consultar a
-  peça, o preço e a disponibilidade.
+- Preço e estoque vêm exclusivamente da API Comercial.
 - Se o cliente pedir para encerrar, use encerrar=true e acao=encerrar.
 - A resposta deve ter no máximo duas frases curtas e 220 caracteres.
 - Não use markdown, listas, emojis nem texto fora do JSON.
@@ -241,6 +245,8 @@ Regras obrigatórias:
 
 INITIAL_SALES_STATE = {
     "nome_cliente": None,
+    "categoria_solicitacao": None,
+    "descricao_solicitada": None,
     "produto": None,
     "tipo_maquina": None,
     "marca_maquina": None,
@@ -248,6 +254,7 @@ INITIAL_SALES_STATE = {
     "quantidade": None,
     "acao_proxima": None,
     "termo_busca": None,
+    "atributos_busca": {},
     "catalogo_status": None,
     "catalogo_tentativas": 0,
     "aguardando_selecao_catalogo": False,
@@ -374,7 +381,7 @@ def transcribe_with_groq(pcm_audio: bytes) -> str:
             "Authorization": f"Bearer {GROQ_API_KEY}",
             "Accept": "application/json",
             "Content-Type": f"multipart/form-data; boundary={boundary}",
-            "User-Agent": "RBK-Vendedor-IA-Gateway/0.6.1",
+            "User-Agent": "RBK-Vendedor-IA-Gateway/0.6.2",
         },
     )
 
@@ -431,7 +438,7 @@ def generate_sales_reply(transcript: str) -> str:
             "Authorization": f"Bearer {GROQ_API_KEY}",
             "Accept": "application/json",
             "Content-Type": "application/json",
-            "User-Agent": "RBK-Vendedor-IA-Gateway/0.6.1",
+            "User-Agent": "RBK-Vendedor-IA-Gateway/0.6.2",
         },
     )
 
@@ -482,6 +489,12 @@ def merge_sales_state(
 ) -> dict:
     merged = {
         "nome_cliente": current_state.get("nome_cliente"),
+        "categoria_solicitacao": current_state.get(
+            "categoria_solicitacao"
+        ),
+        "descricao_solicitada": current_state.get(
+            "descricao_solicitada"
+        ),
         "produto": current_state.get("produto"),
         "tipo_maquina": current_state.get("tipo_maquina"),
         "marca_maquina": current_state.get("marca_maquina"),
@@ -505,6 +518,9 @@ def merge_sales_state(
         "ultima_consulta_catalogo": current_state.get(
             "ultima_consulta_catalogo"
         ),
+        "atributos_busca": dict(
+            current_state.get("atributos_busca") or {}
+        ),
         "dados_tecnicos": dict(
             current_state.get("dados_tecnicos") or {}
         ),
@@ -516,6 +532,8 @@ def merge_sales_state(
 
     for key in (
         "nome_cliente",
+        "categoria_solicitacao",
+        "descricao_solicitada",
         "produto",
         "tipo_maquina",
         "marca_maquina",
@@ -527,6 +545,14 @@ def merge_sales_state(
         cleaned = clean_state_text(incoming_state.get(key))
         if cleaned is not None:
             merged[key] = cleaned
+
+    incoming_attributes = incoming_state.get("atributos_busca")
+    if isinstance(incoming_attributes, dict):
+        for key, value in incoming_attributes.items():
+            clean_key = clean_state_text(key, max_length=80)
+            clean_value = clean_state_text(value, max_length=180)
+            if clean_key and clean_value:
+                merged["atributos_busca"][clean_key] = clean_value
 
     incoming_technical = incoming_state.get("dados_tecnicos")
     if isinstance(incoming_technical, dict):
@@ -566,6 +592,29 @@ PRODUCT_KEYWORDS = (
     "bobina",
     "magneto",
     "virabrequim",
+    "cinto de sustentação",
+    "cinto de sustentacao",
+    "cinto",
+    "luva",
+    "luvas",
+    "óculos de proteção",
+    "oculos de protecao",
+    "óculos",
+    "oculos",
+    "protetor auricular",
+    "perneira",
+    "capacete",
+    "viseira",
+    "avental",
+    "máscara",
+    "mascara",
+    "botina",
+    "bota",
+    "fio de nylon",
+    "carretel",
+    "lâmina",
+    "lamina",
+    "disco",
 )
 
 
@@ -634,6 +683,68 @@ def infer_domain_hints(transcript: str) -> dict:
             "Modelo Stihl identificado pelo prefixo FS."
         )
 
+    texto_normalizado = transcript.casefold()
+
+    epi_keywords = (
+        "luva", "óculos", "oculos", "protetor auricular",
+        "perneira", "capacete", "viseira", "avental",
+        "máscara", "mascara", "botina", "bota",
+    )
+    accessory_keywords = (
+        "cinto", "carretel", "fio de nylon", "lâmina",
+        "lamina", "disco", "suporte",
+    )
+
+    if any(keyword in texto_normalizado for keyword in epi_keywords):
+        hints["categoria_solicitacao"] = "epi"
+    elif any(keyword in texto_normalizado for keyword in accessory_keywords):
+        hints["categoria_solicitacao"] = "acessorio"
+    elif product:
+        hints["categoria_solicitacao"] = "peca"
+
+    descricao = re.sub(
+        r"^\s*(?:ol[áa][, ]*)?"
+        r"(?:(?:eu\s+)?(?:preciso|quero|gostaria|procuro)"
+        r"(?:\s+de)?|tem|voc[eê]s\s+t[eê]m)"
+        r"\s+(?:(?:um|uma|uns|umas)\s+)?",
+        "",
+        transcript,
+        flags=re.IGNORECASE,
+    )
+    descricao = re.sub(
+        r"\s+(?:por favor|para mim|pra mim)\s*$",
+        "",
+        descricao,
+        flags=re.IGNORECASE,
+    ).strip(" .,!?:;")
+
+    if descricao and len(descricao) <= 220:
+        hints["descricao_solicitada"] = descricao
+
+    atributos: dict[str, str] = {}
+    grupos_atributos = {
+        "cor": (
+            "branca", "branco", "preta", "preto", "laranja",
+            "amarela", "amarelo", "verde", "azul", "incolor",
+        ),
+        "material": (
+            "malha", "látex", "latex", "raspa", "vaqueta",
+            "nitrílica", "nitrilica",
+        ),
+        "tipo": (
+            "simples", "duplo", "dupla", "universal",
+            "pigmentada", "pigmentado",
+        ),
+    }
+
+    for grupo, valores in grupos_atributos.items():
+        encontrados = [v for v in valores if v in texto_normalizado]
+        if encontrados:
+            atributos[grupo] = " ".join(encontrados)
+
+    if atributos:
+        hints["atributos_busca"] = atributos
+
     return hints
 
 
@@ -681,52 +792,48 @@ def possui_referencia_exata(state: dict) -> bool:
 
 
 def montar_termo_busca_catalogo(state: dict) -> str:
-    parts = [
+    parts: list[object] = [
+        state.get("descricao_solicitada"),
         state.get("produto"),
+        state.get("tipo_maquina"),
         state.get("marca_maquina"),
         state.get("modelo_maquina"),
     ]
 
-    technical = state.get("dados_tecnicos")
-    if isinstance(technical, dict):
-        for key, value in technical.items():
-            normalized_key = str(key).casefold()
-            if any(
-                term in normalized_key
-                for term in (
-                    "codigo",
-                    "código",
-                    "referencia",
-                    "referência",
-                    "part number",
-                    "sku",
-                )
-            ):
-                parts.append(value)
+    for field_name in ("atributos_busca", "dados_tecnicos"):
+        field_value = state.get(field_name)
+        if isinstance(field_value, dict):
+            parts.extend(field_value.values())
 
     clean_parts: list[str] = []
+    normalized_seen: set[str] = set()
     for value in parts:
-        cleaned = clean_state_text(value, max_length=180)
-        if cleaned and cleaned not in clean_parts:
-            clean_parts.append(cleaned)
+        cleaned = clean_state_text(value, max_length=220)
+        if not cleaned:
+            continue
+        normalized = re.sub(r"\s+", " ", cleaned.casefold()).strip()
+        if normalized in normalized_seen:
+            continue
+        normalized_seen.add(normalized)
+        clean_parts.append(cleaned)
 
     return " ".join(clean_parts)
 
 
 def consulta_catalogo_pronta(state: dict) -> bool:
-    product = clean_state_text(state.get("produto"))
-    model = clean_state_text(state.get("modelo_maquina"))
     return bool(
-        product
-        and (
-            model
-            or possui_referencia_exata(state)
-        )
+        clean_state_text(state.get("produto"))
+        or clean_state_text(state.get("descricao_solicitada"))
+        or possui_referencia_exata(state)
     )
 
 
 def resposta_busca_catalogo(state: dict) -> str:
-    product = clean_state_text(state.get("produto")) or "peça"
+    product = (
+        clean_state_text(state.get("descricao_solicitada"))
+        or clean_state_text(state.get("produto"))
+        or "produto"
+    )
     brand = clean_state_text(state.get("marca_maquina"))
     model = clean_state_text(state.get("modelo_maquina"))
 
@@ -801,7 +908,7 @@ def generate_multiturn_decision(
             "Authorization": f"Bearer {GROQ_API_KEY}",
             "Accept": "application/json",
             "Content-Type": "application/json",
-            "User-Agent": "RBK-Vendedor-IA-Gateway/0.6.1",
+            "User-Agent": "RBK-Vendedor-IA-Gateway/0.6.2",
         },
     )
 
@@ -881,22 +988,31 @@ def generate_multiturn_decision(
         }
 
     product = clean_state_text(updated_state.get("produto"))
-    brand = clean_state_text(updated_state.get("marca_maquina"))
-    model = clean_state_text(updated_state.get("modelo_maquina"))
+    requested_description = clean_state_text(
+        updated_state.get("descricao_solicitada")
+    )
 
     updated_state["acao_proxima"] = "perguntar_dado"
     updated_state["termo_busca"] = None
 
-    if not product:
-        reply = "Qual peça você precisa?"
-    elif not model and not brand:
-        reply = "Qual é a marca e o modelo da máquina?"
-    elif not model:
-        reply = "Qual é o modelo da máquina?"
-    else:
+    if not product and not requested_description:
         reply = (
-            "Qual é o código ou a referência exata da peça?"
+            "Qual peça, acessório ou EPI você procura? "
+            "Pode informar tipo, material, cor ou aplicação."
         )
+    else:
+        search_term = montar_termo_busca_catalogo(updated_state)
+        updated_state["acao_proxima"] = "buscar_produto"
+        updated_state["termo_busca"] = search_term
+        return {
+            "resposta": resposta_busca_catalogo(updated_state),
+            "encerrar": True,
+            "levantamento_completo": True,
+            "motivo_encerramento": "consulta_catalogo_pronta",
+            "acao": "buscar_produto",
+            "termo_busca": search_term,
+            "estado": updated_state,
+        }
 
     return {
         "resposta": reply,
@@ -966,7 +1082,7 @@ def consultar_catalogo_na_api(estado: dict) -> dict:
         headers={
             "X-API-Key": API_COMERCIAL_KEY,
             "Accept": "application/json",
-            "User-Agent": "RBK-Vendedor-IA-Gateway/0.6.1",
+            "User-Agent": "RBK-Vendedor-IA-Gateway/0.6.2",
         },
     )
 
@@ -1349,6 +1465,11 @@ def montar_resumo_deterministico(
 
     campos = [
         ("Cliente", estado.get("nome_cliente")),
+        ("Categoria", estado.get("categoria_solicitacao")),
+        (
+            "Descrição solicitada",
+            estado.get("descricao_solicitada"),
+        ),
         ("Produto", estado.get("produto")),
         ("Tipo de máquina", estado.get("tipo_maquina")),
         ("Marca", estado.get("marca_maquina")),
@@ -1440,7 +1561,7 @@ def persistir_conversa_na_api(payload: dict) -> dict | None:
                 "X-API-Key": API_COMERCIAL_KEY,
                 "Accept": "application/json",
                 "Content-Type": "application/json",
-                "User-Agent": "RBK-Vendedor-IA-Gateway/0.6.1",
+                "User-Agent": "RBK-Vendedor-IA-Gateway/0.6.2",
             },
         )
 
@@ -1458,7 +1579,7 @@ def persistir_conversa_na_api(payload: dict) -> dict | None:
                 logger.info(
                     "PERSISTENCIA API: chamada_externa_id=%s "
                     "http=%s criada=%s idempotente=%s chamada_id=%s "
-                    "interacoes=%s",
+                    "interacoes=%s pendencia_id=%s",
                     payload.get("chamada_externa_id"),
                     response.status,
                     result.get("criada"),
@@ -1467,6 +1588,9 @@ def persistir_conversa_na_api(payload: dict) -> dict | None:
                         result.get("chamada") or {}
                     ).get("id"),
                     result.get("interacoes_registradas"),
+                    (
+                        result.get("venda_futura") or {}
+                    ).get("id"),
                 )
                 return result
 
@@ -2241,8 +2365,8 @@ async def handle_multiturn_session(
                     turn_number,
                 )
                 resposta_catalogo = (
-                    "Não consegui consultar o catálogo agora. "
-                    "A solicitação ficou registrada para continuidade."
+                    "A consulta está temporariamente indisponível. "
+                    "Vou encaminhar o pedido para revisão e retorno."
                 )
                 recorded_turns[-1]["agente"] = (
                     f"{resposta_espera} {resposta_catalogo}"
@@ -2258,8 +2382,8 @@ async def handle_multiturn_session(
                 state["catalogo_status"] = "erro"
                 state["acao_proxima"] = "atendimento_posterior"
                 complete = False
-                end_reason = "falha_consulta_catalogo"
-                result = "falha_consulta_catalogo"
+                end_reason = "revisao_integracao"
+                result = "revisao_integracao"
                 break
 
             if not catalogo_opcoes:
@@ -2270,12 +2394,13 @@ async def handle_multiturn_session(
                         "sem_opcao_comercializavel"
                     )
                     state["acao_proxima"] = (
-                        "atendimento_posterior"
+                        "verificar_disponibilidade"
                     )
                     resposta_catalogo = (
-                        "Encontrei cadastro compatível, mas nenhuma "
-                        "opção está disponível com preço e estoque. "
-                        "A solicitação ficou registrada para atendimento."
+                        "Encontrei produtos compatíveis, mas estão "
+                        "indisponíveis no momento. Vou solicitar a "
+                        "verificação de preço, estoque e previsão de "
+                        "reposição para retorno."
                     )
                     recorded_turns[-1]["agente"] = (
                         f"{resposta_espera} {resposta_catalogo}"
@@ -2288,8 +2413,8 @@ async def handle_multiturn_session(
                         resposta_catalogo,
                         session_uuid,
                     )
-                    end_reason = "sem_opcao_comercializavel"
-                    result = "sem_opcao_comercializavel"
+                    end_reason = "aguardando_disponibilidade"
+                    result = "aguardando_disponibilidade"
                     break
 
                 state["catalogo_status"] = "nao_encontrado"
@@ -2319,8 +2444,9 @@ async def handle_multiturn_session(
                     continue
 
                 resposta_catalogo = (
-                    "Ainda não encontrei a peça no catálogo. "
-                    "A solicitação ficou registrada para atendimento."
+                    "Não localizei o produto com essa descrição. "
+                    "Vou encaminhar a solicitação para revisão do "
+                    "catálogo e retorno comercial."
                 )
                 recorded_turns[-1]["agente"] = (
                     f"{resposta_espera} {resposta_catalogo}"
@@ -2333,8 +2459,8 @@ async def handle_multiturn_session(
                     resposta_catalogo,
                     session_uuid,
                 )
-                end_reason = "produto_nao_encontrado"
-                result = "produto_nao_encontrado"
+                end_reason = "revisao_catalogo"
+                result = "revisao_catalogo"
                 break
 
             if len(catalogo_opcoes) == 1:
@@ -2881,7 +3007,7 @@ async def main() -> None:
         for sock in server.sockets or []
     )
     logger.info(
-        "Gateway de voz RBK v0.6.1 iniciado: endereços=%s "
+        "Gateway de voz RBK v0.6.2 iniciado: endereços=%s "
         "echo_uuid=%s stt_uuid=%s conversation_uuid=%s "
         "multiturn_uuid=%s modelo_stt=%s modelo_llm=%s "
         "max_turnos=%s persistencia_ativa=%s "
