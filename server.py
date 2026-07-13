@@ -341,6 +341,8 @@ INITIAL_SALES_STATE = {
     "carrinho": [],
     "orcamento_id": None,
     "orcamento_status": None,
+    "numero_proposta": None,
+    "proposta_status": None,
     "aguardando_quantidade": False,
     "item_pendente": None,
     "aguardando_mais_produtos": False,
@@ -473,7 +475,7 @@ def transcribe_with_groq(pcm_audio: bytes) -> str:
             "Authorization": f"Bearer {GROQ_API_KEY}",
             "Accept": "application/json",
             "Content-Type": f"multipart/form-data; boundary={boundary}",
-            "User-Agent": "RBK-Vendedor-IA-Gateway/0.7.2",
+            "User-Agent": "RBK-Vendedor-IA-Gateway/0.7.4",
         },
     )
 
@@ -530,7 +532,7 @@ def generate_sales_reply(transcript: str) -> str:
             "Authorization": f"Bearer {GROQ_API_KEY}",
             "Accept": "application/json",
             "Content-Type": "application/json",
-            "User-Agent": "RBK-Vendedor-IA-Gateway/0.7.2",
+            "User-Agent": "RBK-Vendedor-IA-Gateway/0.7.4",
         },
     )
 
@@ -619,6 +621,12 @@ def merge_sales_state(
         "orcamento_id": current_state.get("orcamento_id"),
         "orcamento_status": current_state.get(
             "orcamento_status"
+        ),
+        "numero_proposta": current_state.get(
+            "numero_proposta"
+        ),
+        "proposta_status": current_state.get(
+            "proposta_status"
         ),
         "aguardando_quantidade": bool(
             current_state.get("aguardando_quantidade")
@@ -1080,7 +1088,7 @@ def generate_multiturn_decision(
             "Authorization": f"Bearer {GROQ_API_KEY}",
             "Accept": "application/json",
             "Content-Type": "application/json",
-            "User-Agent": "RBK-Vendedor-IA-Gateway/0.7.2",
+            "User-Agent": "RBK-Vendedor-IA-Gateway/0.7.4",
         },
     )
 
@@ -1255,7 +1263,7 @@ def consultar_catalogo_na_api(estado: dict) -> dict:
         headers={
             "X-API-Key": API_COMERCIAL_KEY,
             "Accept": "application/json",
-            "User-Agent": "RBK-Vendedor-IA-Gateway/0.7.2",
+            "User-Agent": "RBK-Vendedor-IA-Gateway/0.7.4",
         },
     )
 
@@ -2064,7 +2072,7 @@ def requisicao_json_api_comercial(
     headers = {
         "X-API-Key": API_COMERCIAL_KEY,
         "Accept": "application/json",
-        "User-Agent": "RBK-Vendedor-IA-Gateway/0.7.2",
+        "User-Agent": "RBK-Vendedor-IA-Gateway/0.7.4",
     }
     if body is not None:
         headers["Content-Type"] = "application/json"
@@ -2396,7 +2404,7 @@ def persistir_conversa_na_api(payload: dict) -> dict | None:
                 "X-API-Key": API_COMERCIAL_KEY,
                 "Accept": "application/json",
                 "Content-Type": "application/json",
-                "User-Agent": "RBK-Vendedor-IA-Gateway/0.7.2",
+                "User-Agent": "RBK-Vendedor-IA-Gateway/0.7.4",
             },
         )
 
@@ -3258,13 +3266,62 @@ async def handle_multiturn_session(
                     )
 
                 if confirmacao_persistida:
-                    resposta_final = (
-                        "Certo. Os itens foram confirmados para "
-                        "a geração do orçamento."
+                    proposta = (
+                        retorno_final.get("proposta_comercial")
+                        if isinstance(retorno_final, dict)
+                        else None
                     )
+                    status_proposta = (
+                        proposta.get("status")
+                        if isinstance(proposta, dict)
+                        else None
+                    )
+                    numero_proposta = (
+                        proposta.get("numero_proposta")
+                        if isinstance(proposta, dict)
+                        else None
+                    )
+
+                    state["numero_proposta"] = numero_proposta
+                    state["proposta_status"] = status_proposta
+
+                    if status_proposta == "aguardando_revisao":
+                        resposta_final = (
+                            "Certo. A proposta comercial "
+                            + (
+                                f"{numero_proposta} "
+                                if numero_proposta
+                                else ""
+                            )
+                            + "foi criada e ficou aguardando revisão."
+                        )
+                        result = "proposta_aguardando_revisao"
+                        end_reason = "proposta_aguardando_revisao"
+                    elif status_proposta == "aguardando_documento_cliente":
+                        resposta_final = (
+                            "A proposta foi registrada, mas falta "
+                            "CPF ou CNPJ para localizar o cliente. "
+                            "Ela ficou para revisão."
+                        )
+                        result = "proposta_aguardando_documento"
+                        end_reason = "proposta_aguardando_documento"
+                    elif status_proposta == "cliente_nao_localizado_olist":
+                        resposta_final = (
+                            "A proposta foi registrada, mas o cliente "
+                            "não foi localizado pelo CPF ou CNPJ. "
+                            "Ela ficou para revisão."
+                        )
+                        result = "proposta_cliente_nao_localizado"
+                        end_reason = "proposta_cliente_nao_localizado"
+                    else:
+                        resposta_final = (
+                            "A proposta comercial foi registrada "
+                            "e ficou para revisão."
+                        )
+                        result = "proposta_em_revisao"
+                        end_reason = "proposta_em_revisao"
+
                     complete = True
-                    end_reason = "orcamento_confirmado"
-                    result = "orcamento_confirmado"
                 else:
                     resposta_final = (
                         "Registrei os itens, mas houve uma falha "
@@ -4357,7 +4414,7 @@ async def main() -> None:
         for sock in server.sockets or []
     )
     logger.info(
-        "Gateway de voz RBK v0.7.2 iniciado: endereços=%s "
+        "Gateway de voz RBK v0.7.4 iniciado: endereços=%s "
         "echo_uuid=%s stt_uuid=%s conversation_uuid=%s "
         "multiturn_uuid=%s modelo_stt=%s modelo_llm=%s "
         "max_turnos=%s persistencia_ativa=%s "
