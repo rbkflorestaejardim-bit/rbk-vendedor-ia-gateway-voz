@@ -155,11 +155,67 @@ ENCARTE_MAX_RECUSAS_CONSECUTIVAS = max(
     ),
 )
 
-VAD_RMS_THRESHOLD = int(os.getenv("VAD_RMS_THRESHOLD", "350"))
-SILENCE_SECONDS = float(os.getenv("SILENCE_SECONDS", "0.70"))
-MIN_SPEECH_SECONDS = float(os.getenv("MIN_SPEECH_SECONDS", "0.45"))
-MAX_CAPTURE_SECONDS = float(os.getenv("MAX_CAPTURE_SECONDS", "12"))
+VAD_RMS_THRESHOLD = max(
+    180,
+    min(
+        int(os.getenv("VAD_RMS_THRESHOLD", "300")),
+        420,
+    ),
+)
+SILENCE_SECONDS = max(
+    0.40,
+    min(
+        float(os.getenv("SILENCE_SECONDS", "0.55")),
+        0.65,
+    ),
+)
+MIN_SPEECH_SECONDS = max(
+    0.12,
+    min(
+        float(os.getenv("MIN_SPEECH_SECONDS", "0.20")),
+        0.30,
+    ),
+)
+MAX_CAPTURE_SECONDS = max(
+    6.0,
+    min(
+        float(os.getenv("MAX_CAPTURE_SECONDS", "10")),
+        14.0,
+    ),
+)
 PRE_ROLL_SECONDS = float(os.getenv("PRE_ROLL_SECONDS", "0.3"))
+POST_TTS_ECHO_GUARD_SECONDS = max(
+    0.0,
+    min(
+        float(
+            os.getenv(
+                "POST_TTS_ECHO_GUARD_SECONDS",
+                "0.08",
+            )
+        ),
+        0.20,
+    ),
+)
+MULTITURN_TONE_ENABLED = os.getenv(
+    "MULTITURN_TONE_ENABLED",
+    "false",
+).strip().lower() in {"1", "true", "yes", "sim"}
+BUSCA_RAPIDA_LOCAL_ATIVA = os.getenv(
+    "BUSCA_RAPIDA_LOCAL_ATIVA",
+    "true",
+).strip().lower() in {"1", "true", "yes", "sim"}
+MAX_SEM_FALA_TENTATIVAS = max(
+    2,
+    min(
+        int(
+            os.getenv(
+                "MAX_SEM_FALA_TENTATIVAS",
+                "3",
+            )
+        ),
+        4,
+    ),
+)
 
 SAMPLE_RATE = 8000
 SAMPLE_WIDTH = 2
@@ -179,14 +235,12 @@ MAX_PAYLOAD = 65535
 
 GREETING_TEXT = (
     "Olá. Aqui é o Carlos da RBK Distribuidora. "
-    "Este é um teste do vendedor virtual. "
-    "Depois do sinal, diga seu nome e o produto que deseja consultar."
+    "Diga seu nome e o produto que deseja consultar."
 )
 
 MULTITURN_GREETING_TEXT = (
-    "Olá. Aqui é o Carlos da RBK Distribuidora. "
-    "Diga a peça, acessório ou EPI que você procura. "
-    "Depois do sinal, pode falar."
+    "Olá, aqui é o Carlos da RBK Distribuidora. "
+    "Qual peça, acessório ou EPI você precisa?"
 )
 
 SYSTEM_PROMPT = """
@@ -419,7 +473,7 @@ def transcribe_with_groq(pcm_audio: bytes) -> str:
             "Authorization": f"Bearer {GROQ_API_KEY}",
             "Accept": "application/json",
             "Content-Type": f"multipart/form-data; boundary={boundary}",
-            "User-Agent": "RBK-Vendedor-IA-Gateway/0.7.1",
+            "User-Agent": "RBK-Vendedor-IA-Gateway/0.7.2",
         },
     )
 
@@ -476,7 +530,7 @@ def generate_sales_reply(transcript: str) -> str:
             "Authorization": f"Bearer {GROQ_API_KEY}",
             "Accept": "application/json",
             "Content-Type": "application/json",
-            "User-Agent": "RBK-Vendedor-IA-Gateway/0.7.1",
+            "User-Agent": "RBK-Vendedor-IA-Gateway/0.7.2",
         },
     )
 
@@ -931,14 +985,46 @@ def resposta_busca_catalogo(state: dict) -> str:
 
     if application:
         return (
-            f"Certo. Vou procurar {product} para {application} "
-            "e consultar preço e disponibilidade."
+            f"Certo. Vou localizar {product} para {application}."
         )
 
-    return (
-        f"Certo. Vou procurar {product} "
-        "e consultar preço e disponibilidade."
+    return f"Certo. Vou localizar {product}."
+
+def gerar_decisao_busca_rapida(
+    transcript: str,
+    current_state: dict,
+) -> dict | None:
+    if not BUSCA_RAPIDA_LOCAL_ATIVA:
+        return None
+
+    if canonical_product(transcript) is None:
+        return None
+
+    updated_state = merge_sales_state(
+        current_state,
+        infer_domain_hints(transcript),
     )
+
+    if not consulta_catalogo_pronta(updated_state):
+        return None
+
+    search_term = montar_termo_busca_catalogo(
+        updated_state
+    )
+    updated_state["acao_proxima"] = "buscar_produto"
+    updated_state["termo_busca"] = search_term
+
+    return {
+        "resposta": "",
+        "encerrar": False,
+        "levantamento_completo": False,
+        "motivo_encerramento": "",
+        "acao": "buscar_produto",
+        "termo_busca": search_term,
+        "estado": updated_state,
+        "origem_decisao": "regra_local_rapida",
+    }
+
 
 def generate_multiturn_decision(
     transcript: str,
@@ -994,7 +1080,7 @@ def generate_multiturn_decision(
             "Authorization": f"Bearer {GROQ_API_KEY}",
             "Accept": "application/json",
             "Content-Type": "application/json",
-            "User-Agent": "RBK-Vendedor-IA-Gateway/0.7.1",
+            "User-Agent": "RBK-Vendedor-IA-Gateway/0.7.2",
         },
     )
 
@@ -1151,6 +1237,7 @@ def consultar_catalogo_na_api(estado: dict) -> dict:
         "marca": estado.get("marca_maquina"),
         "modelo": estado.get("modelo_maquina"),
         "limite": max(1, min(CONSULTA_CATALOGO_LIMITE, 10)),
+        "consultar_estoque": "false",
     }
     parametros = {
         chave: valor
@@ -1168,7 +1255,7 @@ def consultar_catalogo_na_api(estado: dict) -> dict:
         headers={
             "X-API-Key": API_COMERCIAL_KEY,
             "Accept": "application/json",
-            "User-Agent": "RBK-Vendedor-IA-Gateway/0.7.1",
+            "User-Agent": "RBK-Vendedor-IA-Gateway/0.7.2",
         },
     )
 
@@ -1977,7 +2064,7 @@ def requisicao_json_api_comercial(
     headers = {
         "X-API-Key": API_COMERCIAL_KEY,
         "Accept": "application/json",
-        "User-Agent": "RBK-Vendedor-IA-Gateway/0.7.1",
+        "User-Agent": "RBK-Vendedor-IA-Gateway/0.7.2",
     }
     if body is not None:
         headers["Content-Type"] = "application/json"
@@ -2309,7 +2396,7 @@ def persistir_conversa_na_api(payload: dict) -> dict | None:
                 "X-API-Key": API_COMERCIAL_KEY,
                 "Accept": "application/json",
                 "Content-Type": "application/json",
-                "User-Agent": "RBK-Vendedor-IA-Gateway/0.7.1",
+                "User-Agent": "RBK-Vendedor-IA-Gateway/0.7.2",
             },
         )
 
@@ -2561,6 +2648,25 @@ async def send_tone(
             await asyncio.sleep(AUDIO_FRAME_MS / 1000)
 
 
+async def send_multiturn_tone(
+    writer: asyncio.StreamWriter,
+) -> None:
+    if MULTITURN_TONE_ENABLED:
+        await send_tone(writer)
+
+
+def calcular_descarte_multiturno(
+    duracao_audio: float,
+) -> float:
+    duracao_tom = 0.30 if MULTITURN_TONE_ENABLED else 0.0
+    return max(
+        0.0,
+        float(duracao_audio)
+        + duracao_tom
+        + POST_TTS_ECHO_GUARD_SECONDS,
+    )
+
+
 async def read_audiosocket_frame(
     reader: asyncio.StreamReader,
 ) -> tuple[int, bytes] | None:
@@ -2766,8 +2872,8 @@ async def handle_multiturn_session(
         MULTITURN_GREETING_TEXT,
         session_uuid,
     )
-    await send_tone(writer)
-    discard_seconds = greeting_duration + 0.45
+    await send_multiturn_tone(writer)
+    discard_seconds = calcular_descarte_multiturno(greeting_duration)
 
     for turn_number in range(1, MAX_CONVERSATION_TURNS + 1):
         logger.info(
@@ -2814,7 +2920,7 @@ async def handle_multiturn_session(
                 capture.max_rms,
             )
 
-            if no_speech_attempts >= 2:
+            if no_speech_attempts >= MAX_SEM_FALA_TENTATIVAS:
                 await speak_text(
                     writer,
                     (
@@ -2830,13 +2936,13 @@ async def handle_multiturn_session(
             retry_duration = await speak_text(
                 writer,
                 (
-                    "Não ouvi sua resposta. "
-                    "Fale depois do sinal."
+                    "Não consegui ouvir. "
+                    "Pode repetir?"
                 ),
                 session_uuid,
             )
-            await send_tone(writer)
-            discard_seconds = retry_duration + 0.45
+            await send_multiturn_tone(writer)
+            discard_seconds = calcular_descarte_multiturno(retry_duration)
             continue
 
         no_speech_attempts = 0
@@ -2867,13 +2973,13 @@ async def handle_multiturn_session(
             retry_duration = await speak_text(
                 writer,
                 (
-                    "Não consegui entender o áudio. "
-                    "Repita depois do sinal."
+                    "Não consegui entender. "
+                    "Pode repetir?"
                 ),
                 session_uuid,
             )
-            await send_tone(writer)
-            discard_seconds = retry_duration + 0.45
+            await send_multiturn_tone(writer)
+            discard_seconds = calcular_descarte_multiturno(retry_duration)
             continue
 
         if state.get("aguardando_quantidade"):
@@ -2888,8 +2994,7 @@ async def handle_multiturn_session(
                 or not isinstance(item_pendente, dict)
             ):
                 resposta_quantidade = (
-                    "Não identifiquei a quantidade. "
-                    "Quantas unidades você precisa?"
+                    "Qual quantidade você precisa?"
                 )
                 recorded_turns.append(
                     {
@@ -2912,8 +3017,8 @@ async def handle_multiturn_session(
                     resposta_quantidade,
                     session_uuid,
                 )
-                await send_tone(writer)
-                discard_seconds = duracao + 0.45
+                await send_multiturn_tone(writer)
+                discard_seconds = calcular_descarte_multiturno(duracao)
                 continue
 
             state = adicionar_item_carrinho_local(
@@ -2957,12 +3062,8 @@ async def handle_multiturn_session(
             state["encarte_recusas_consecutivas"] = 0
 
             resposta_adicionado = (
-                "Adicionei "
+                "Certo, adicionei "
                 + formatar_quantidade_para_voz(quantidade)
-                + " de "
-                + descricao_para_voz(
-                    item_pendente.get("descricao")
-                )
                 + ". Qual outro produto você precisa?"
             )
             recorded_turns.append(
@@ -2986,8 +3087,8 @@ async def handle_multiturn_session(
                 resposta_adicionado,
                 session_uuid,
             )
-            await send_tone(writer)
-            discard_seconds = duracao + 0.45
+            await send_multiturn_tone(writer)
+            discard_seconds = calcular_descarte_multiturno(duracao)
             continue
 
         if state.get("aguardando_resposta_encarte"):
@@ -3029,8 +3130,8 @@ async def handle_multiturn_session(
                     resposta_encarte,
                     session_uuid,
                 )
-                await send_tone(writer)
-                discard_seconds = duracao + 0.45
+                await send_multiturn_tone(writer)
+                discard_seconds = calcular_descarte_multiturno(duracao)
                 continue
 
             if (
@@ -3089,8 +3190,8 @@ async def handle_multiturn_session(
                             mensagem_oferta,
                             session_uuid,
                         )
-                        await send_tone(writer)
-                        discard_seconds = duracao + 0.45
+                        await send_multiturn_tone(writer)
+                        discard_seconds = calcular_descarte_multiturno(duracao)
                         continue
 
                 state["encarte_concluido"] = True
@@ -3119,8 +3220,8 @@ async def handle_multiturn_session(
                     resposta_confirmacao,
                     session_uuid,
                 )
-                await send_tone(writer)
-                discard_seconds = duracao + 0.45
+                await send_multiturn_tone(writer)
+                discard_seconds = calcular_descarte_multiturno(duracao)
                 continue
 
             # O cliente pode interromper a oferta e pedir outro produto.
@@ -3222,8 +3323,8 @@ async def handle_multiturn_session(
                 resposta_ajuste,
                 session_uuid,
             )
-            await send_tone(writer)
-            discard_seconds = duracao + 0.45
+            await send_multiturn_tone(writer)
+            discard_seconds = calcular_descarte_multiturno(duracao)
             continue
 
         if state.get("aguardando_mais_produtos"):
@@ -3280,8 +3381,8 @@ async def handle_multiturn_session(
                             mensagem_oferta,
                             session_uuid,
                         )
-                        await send_tone(writer)
-                        discard_seconds = duracao + 0.45
+                        await send_multiturn_tone(writer)
+                        discard_seconds = calcular_descarte_multiturno(duracao)
                         continue
 
                 state["aguardando_confirmacao_orcamento"] = True
@@ -3309,8 +3410,8 @@ async def handle_multiturn_session(
                     resposta_confirmacao,
                     session_uuid,
                 )
-                await send_tone(writer)
-                discard_seconds = duracao + 0.45
+                await send_multiturn_tone(writer)
+                discard_seconds = calcular_descarte_multiturno(duracao)
                 continue
 
             state = preparar_nova_busca(state)
@@ -3353,8 +3454,8 @@ async def handle_multiturn_session(
                     resposta_selecao,
                     session_uuid,
                 )
-                await send_tone(writer)
-                discard_seconds = resposta_duracao + 0.45
+                await send_multiturn_tone(writer)
+                discard_seconds = calcular_descarte_multiturno(resposta_duracao)
                 continue
 
             state["produto_selecionado"] = opcao_escolhida
@@ -3398,17 +3499,23 @@ async def handle_multiturn_session(
                 resposta_selecao,
                 session_uuid,
             )
-            await send_tone(writer)
-            discard_seconds = duracao + 0.45
+            await send_multiturn_tone(writer)
+            discard_seconds = calcular_descarte_multiturno(duracao)
             continue
 
+        decision = gerar_decisao_busca_rapida(
+            transcript,
+            state,
+        )
+
         try:
-            decision = await asyncio.to_thread(
-                generate_multiturn_decision,
-                transcript,
-                state,
-                history,
-            )
+            if decision is None:
+                decision = await asyncio.to_thread(
+                    generate_multiturn_decision,
+                    transcript,
+                    state,
+                    history,
+                )
         except Exception:
             logger.exception(
                 "Falha na decisão multi-turno: uuid=%s turno=%s",
@@ -3497,14 +3604,7 @@ async def handle_multiturn_session(
                 state["catalogo_tentativas"]
             )
 
-            resposta_espera = reply or (
-                "Certo. Vou consultar o catálogo agora."
-            )
-            await speak_text(
-                writer,
-                resposta_espera,
-                session_uuid,
-            )
+            resposta_espera = ""
 
             try:
                 catalogo_payload = await asyncio.to_thread(
@@ -3576,7 +3676,7 @@ async def handle_multiturn_session(
                     "Qual outro produto você precisa?"
                 )
                 recorded_turns[-1]["agente"] = (
-                    f"{resposta_espera} {resposta_catalogo}"
+                    resposta_catalogo
                 )
                 history[-1]["content"] = (
                     recorded_turns[-1]["agente"]
@@ -3586,8 +3686,8 @@ async def handle_multiturn_session(
                     resposta_catalogo,
                     session_uuid,
                 )
-                await send_tone(writer)
-                discard_seconds = duracao + 0.45
+                await send_multiturn_tone(writer)
+                discard_seconds = calcular_descarte_multiturno(duracao)
                 complete = False
                 continue
 
@@ -3615,7 +3715,7 @@ async def handle_multiturn_session(
                         "Qual outro produto você precisa?"
                     )
                     recorded_turns[-1]["agente"] = (
-                        f"{resposta_espera} {resposta_catalogo}"
+                        resposta_catalogo
                     )
                     history[-1]["content"] = (
                         recorded_turns[-1]["agente"]
@@ -3625,8 +3725,8 @@ async def handle_multiturn_session(
                         resposta_catalogo,
                         session_uuid,
                     )
-                    await send_tone(writer)
-                    discard_seconds = duracao + 0.45
+                    await send_multiturn_tone(writer)
+                    discard_seconds = calcular_descarte_multiturno(duracao)
                     continue
 
                 state["catalogo_status"] = "nao_encontrado"
@@ -3641,7 +3741,7 @@ async def handle_multiturn_session(
                         "Você tem o código ou a referência da peça?"
                     )
                     recorded_turns[-1]["agente"] = (
-                        f"{resposta_espera} {resposta_catalogo}"
+                        resposta_catalogo
                     )
                     history[-1]["content"] = (
                         recorded_turns[-1]["agente"]
@@ -3651,8 +3751,8 @@ async def handle_multiturn_session(
                         resposta_catalogo,
                         session_uuid,
                     )
-                    await send_tone(writer)
-                    discard_seconds = resposta_duracao + 0.45
+                    await send_multiturn_tone(writer)
+                    discard_seconds = calcular_descarte_multiturno(resposta_duracao)
                     continue
 
                 state = registrar_pendencia_catalogo_local(
@@ -3672,7 +3772,7 @@ async def handle_multiturn_session(
                     "para revisão. Qual outro produto você precisa?"
                 )
                 recorded_turns[-1]["agente"] = (
-                    f"{resposta_espera} {resposta_catalogo}"
+                    resposta_catalogo
                 )
                 history[-1]["content"] = (
                     recorded_turns[-1]["agente"]
@@ -3682,8 +3782,8 @@ async def handle_multiturn_session(
                     resposta_catalogo,
                     session_uuid,
                 )
-                await send_tone(writer)
-                discard_seconds = duracao + 0.45
+                await send_multiturn_tone(writer)
+                discard_seconds = calcular_descarte_multiturno(duracao)
                 continue
 
             if len(catalogo_opcoes) == 1:
@@ -3706,7 +3806,7 @@ async def handle_multiturn_session(
                     + ". Quantas unidades você precisa?"
                 )
                 recorded_turns[-1]["agente"] = (
-                    f"{resposta_espera} {resposta_catalogo}"
+                    resposta_catalogo
                 )
                 history[-1]["content"] = (
                     recorded_turns[-1]["agente"]
@@ -3716,8 +3816,8 @@ async def handle_multiturn_session(
                     resposta_catalogo,
                     session_uuid,
                 )
-                await send_tone(writer)
-                discard_seconds = duracao + 0.45
+                await send_multiturn_tone(writer)
+                discard_seconds = calcular_descarte_multiturno(duracao)
                 complete = False
                 continue
 
@@ -3730,7 +3830,7 @@ async def handle_multiturn_session(
                 catalogo_opcoes
             )
             recorded_turns[-1]["agente"] = (
-                f"{resposta_espera} {resposta_catalogo}"
+                resposta_catalogo
             )
             history[-1]["content"] = (
                 recorded_turns[-1]["agente"]
@@ -3740,8 +3840,8 @@ async def handle_multiturn_session(
                 resposta_catalogo,
                 session_uuid,
             )
-            await send_tone(writer)
-            discard_seconds = resposta_duracao + 0.45
+            await send_multiturn_tone(writer)
+            discard_seconds = calcular_descarte_multiturno(resposta_duracao)
             continue
 
         reached_limit = (
@@ -3795,8 +3895,8 @@ async def handle_multiturn_session(
             )
             break
 
-        await send_tone(writer)
-        discard_seconds = reply_duration + 0.45
+        await send_multiturn_tone(writer)
+        discard_seconds = calcular_descarte_multiturno(reply_duration)
 
     finished_at = datetime.now(timezone.utc)
     duration_seconds = max(
@@ -4257,7 +4357,7 @@ async def main() -> None:
         for sock in server.sockets or []
     )
     logger.info(
-        "Gateway de voz RBK v0.7.1 iniciado: endereços=%s "
+        "Gateway de voz RBK v0.7.2 iniciado: endereços=%s "
         "echo_uuid=%s stt_uuid=%s conversation_uuid=%s "
         "multiturn_uuid=%s modelo_stt=%s modelo_llm=%s "
         "max_turnos=%s persistencia_ativa=%s "

@@ -1,18 +1,19 @@
-# RBK Vendedor IA — Gateway de Voz v0.7.1
+# RBK Vendedor IA — Gateway de Voz v0.7.2
 
-## Correção
+- remove a orientação para falar depois do sinal;
+- desativa o sinal entre turnos por padrão;
+- melhora a captura de respostas curtas;
+- reduz a pausa para detectar o fim da fala;
+- elimina a descrição repetida antes da consulta;
+- não repete a descrição inteira após adicionar a quantidade;
+- usa decisão local rápida para produtos reconhecidos;
+- pesquisa descrição e preço sem consultar estoque.
 
-A versão 0.7.0 ainda exigia preço e estoque para aceitar produtos do catálogo.
-Isso fazia Carlos falar em indisponibilidade e encerrar a ligação.
+Variáveis novas:
 
-A versão 0.7.1 aplica:
-
-- produto com preço válido pode entrar no orçamento independentemente do estoque;
-- estoque não é falado durante a seleção;
-- produto sem preço é registrado para revisão;
-- produto não encontrado é registrado para revisão;
-- falha de consulta é registrada para revisão;
-- nenhuma dessas situações encerra a conversa imediatamente;
-- Carlos pergunta qual outro produto o cliente precisa.
-
-As ofertas do encarte continuam sem mencionar estoque ou disponibilidade.
+```env
+MULTITURN_TONE_ENABLED=false
+POST_TTS_ECHO_GUARD_SECONDS=0.08
+BUSCA_RAPIDA_LOCAL_ATIVA=true
+MAX_SEM_FALA_TENTATIVAS=3
+```
